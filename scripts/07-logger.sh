@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# logger.sh - subsistema de logs para o auto-builder
-# Requisitos: bash, mkdir, date, grep, sed, tar (opcionais: gzip)
-# Integração: source logger.sh && log_init && log_start ... log_end ...
+# logger.sh - subsistema de logs para o auto-builder (versão atualizada com checks específicos)
+# Requisitos: bash, mkdir, date, grep, sed, tar, sha256sum, gzip, rsync (opcional)
 set -u
-# pipefail em bash
 if [ -n "${BASH_VERSION-}" ]; then
   set -o pipefail
 fi
@@ -51,11 +49,9 @@ log_mkpath() {
 }
 
 json_escape() {
-  # simples escape para strings de JSON (não robusto para todos os casos, suficiente aqui)
   echo "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
-# log level numeric
 level_to_num() {
   case "${1:-INFO}" in
     DEBUG) echo 10 ;;
@@ -79,7 +75,6 @@ log_init() {
   log_mkpath "$LOG_DIR"/error
   log_mkpath "$LOG_DIR"/summary
   log_mkpath "$DB_DIR"
-  # summary master file
   SUMMARY_JSON="$LOG_DIR/summary/summary.json"
   if [ ! -f "$SUMMARY_JSON" ]; then
     printf '{ "runs": [] }' > "$SUMMARY_JSON"
@@ -87,7 +82,6 @@ log_init() {
 }
 
 ##### Abrir log de uma etapa #####
-# log_start <stage> <package> [extra_context_json]
 log_start() {
   local stage="$1"; local pkg="$2"; local ctx="${3-}"
   : "${stage:?}" : "${pkg:?}"
@@ -95,23 +89,19 @@ log_start() {
   log_mkpath "$pkgdir"
   local start_ts=$(_epoch)
   local start_iso=$(_now)
-  # arquivos
   local meta="$pkgdir/meta.json"
   local out="$pkgdir/output.log"
   local err="$pkgdir/error.log"
   printf '{"package":"%s","stage":"%s","start_time":"%s","status":"RUNNING","errors":[],"warnings":[]}\n' \
     "$(json_escape "$pkg")" "$(json_escape "$stage")" "$start_iso" > "$meta"
-  # touch logs
   : > "$out"
   : > "$err"
-  # export context for other functions
   export LOGGER_CURRENT_STAGE="$stage"
   export LOGGER_CURRENT_PKG="$pkg"
   export LOGGER_CURRENT_META="$meta"
   export LOGGER_CURRENT_OUT="$out"
   export LOGGER_CURRENT_ERR="$err"
   export LOGGER_CURRENT_START_TS="$start_ts"
-  # nice terminal message
   if _should_log DEBUG; then
     printf "%b[>]%b START %s:%s (%s)\n" "$COLOR_BLUE" "$COLOR_RESET" "$stage" "$pkg" "$start_iso"
   else
@@ -124,12 +114,8 @@ _log_append() {
   local type="$1"; local msg="$2"
   [ -z "${LOGGER_CURRENT_OUT-}" ] && return 0
   echo "[$(_now)] ${msg}" >> "${LOGGER_CURRENT_${type^^}}"
-  # update meta json arrays (simple: append line to meta "warnings" or "errors")
   if [ -f "$LOGGER_CURRENT_META" ]; then
-    # Insert into JSON by naive sed: add to array before closing ]
-    # This is not perfect JSON manipulation but keeps small footprint.
     if echo "$type" | grep -qi '^err'; then
-      # add to errors
       tmp=$(mktemp)
       awk -v s="$(json_escape "$msg")" '
         BEGIN{added=0}
@@ -146,7 +132,6 @@ _log_append() {
         {print}
       ' "$LOGGER_CURRENT_META" > "$tmp" && mv "$tmp" "$LOGGER_CURRENT_META"
     else
-      # warnings
       tmp=$(mktemp)
       awk -v s="$(json_escape "$msg")" '
         BEGIN{added=0}
@@ -173,7 +158,6 @@ log_info() {
 }
 
 log_debug() {
-  [ $(_should_log DEBUG) = 1 ] 2>/dev/null || true
   if _should_log DEBUG ; then
     local msg="$*"
     echo "[$(_now)] DEBUG: $msg" >> "${LOGGER_CURRENT_OUT-}"
@@ -191,13 +175,11 @@ log_error() {
   local msg="$*"
   printf "%b[✖] ERROR:%b %s\n" "$COLOR_RED" "$COLOR_RESET" "$msg" | tee -a "${LOGGER_CURRENT_ERR-}" >&2
   _log_append err "ERROR: $msg"
-  # write status file in DB_DIR
   if [ -n "${LOGGER_CURRENT_PKG-}" ]; then
     log_set_status "$LOGGER_CURRENT_PKG" "$LOGGER_CURRENT_STAGE" "FAIL" "$msg"
   fi
 }
 
-# Escreve status para /var/lib/pkgdb/<pkg>/status
 log_set_status() {
   local pkg="$1"; local stage="$2"; local status="$3"; local msg="${4-}"
   local pkgdb="$DB_DIR/$pkg"
@@ -229,7 +211,6 @@ detect_silent_errors() {
       log_warn "Detected suspicious patterns in stdout for ${LOGGER_CURRENT_PKG:-unknown}"
     fi
   fi
-  # check truncation / empty logs
   if [ -f "$outfile" ] && [ ! -s "$outfile" ]; then
     found=1
     log_error "Output log is empty (possible silent failure)"
@@ -237,36 +218,163 @@ detect_silent_errors() {
   return $found
 }
 
-##### Valida a criação de artefatos básicos (heurística) #####
+##### UTIL: detecta se arquivo é ELF (binário) #####
+is_elf() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  file "$f" 2>/dev/null | grep -qi 'ELF' && return 0
+  return 1
+}
+
+##### Validação de artefatos com checagens específicas para Firefox/KDE/GNOME #####
 check_artifacts() {
   local pkg="${LOGGER_CURRENT_PKG-}"
   local stage="${LOGGER_CURRENT_STAGE-}"
   local destdir="${DESTDIR-}"
+  local builddir="${BUILD_DIR-}"
   local ok=1
+  # If stage is install, ensure DESTDIR has files
   if [ "$stage" = "install" ]; then
-    # if DESTDIR not set, try /tmp/${pkg}_dest
-    if [ -z "${DESTDIR-}" ]; then
+    if [ -z "${destdir-}" ]; then
       destdir="./work/${pkg}/destdir"
     fi
     if [ ! -d "$destdir" ] || [ -z "$(ls -A "$destdir" 2>/dev/null)" ]; then
       log_error "No files installed into DESTDIR (empty or missing): $destdir"
       ok=0
     fi
+    # package-specific checks (install)
+    case "${pkg%%-*}" in
+      firefox|firefoxes|mozilla*|iceweasel)
+        _check_firefox_install "$destdir" || ok=0
+        ;;
+      plasma|kde|kwin|kde-*|kdeframeworks|kde-frameworks)
+        _check_kde_install "$destdir" || ok=0
+        ;;
+      gnome|gnome-shell|gnome-*|epiphany)
+        _check_gnome_install "$destdir" || ok=0
+        ;;
+      *)
+        # generic: ensure there is at least one bin or lib file
+        if ! _check_generic_installed "$destdir"; then ok=0; fi
+        ;;
+    esac
   elif [ "$stage" = "build" ]; then
-    # check common artifacts under build dir or packages dir
-    # This is heuristic — projects vary. We check for typical expected outputs.
-    if [ -n "${BUILD_DIR-}" ] && [ -d "${BUILD_DIR}" ]; then
-      if [ -z "$(find "$BUILD_DIR" -maxdepth 3 -type f -name "*.so" -o -name "${pkg}*" 2>/dev/null)" ]; then
-        # don't treat absence of .so as fatal for small pkgs, mark warning
-        log_warn "No shared libraries or obvious binaries found under $BUILD_DIR (heuristic)"
-      fi
+    # build stage checks; check builddir heuristics
+    if [ -n "${builddir-}" ] && [ -d "${builddir}" ]; then
+      case "${pkg%%-*}" in
+        firefox|firefoxes|mozilla*|iceweasel)
+          _check_firefox_build "$builddir" || ok=0
+          ;;
+        plasma|kde|kwin|kde-*|kdeframeworks|kde-frameworks)
+          _check_kde_build "$builddir" || ok=0
+          ;;
+        gnome|gnome-shell|gnome-*|epiphany)
+          _check_gnome_build "$builddir" || ok=0
+          ;;
+        *)
+          # generic build check: search for shared libs or executables
+          if [ -z "$(find "$builddir" -maxdepth 5 -type f \( -name '*.so' -o -perm -111 -name '*' \) 2>/dev/null | head -n1)" ]; then
+            log_warn "No obvious build artifacts (.so or executables) found under $builddir (heuristic)"
+          fi
+          ;;
+      esac
+    else
+      log_warn "BUILD_DIR not set or missing; skipping build artifact heuristics"
     fi
   fi
   return $ok
 }
 
-##### Finaliza log de etapa #####
-# log_end <exit_code>
+# -------------------------
+# Package specific artifact checks
+# These functions return 0 if OK, non-zero if missing critical artifacts
+# -------------------------
+_check_generic_installed() {
+  local dest="$1"
+  if [ -n "$(find "$dest" -maxdepth 3 -type f \( -name '*.so' -o -perm -111 -name '*' \) 2>/dev/null | head -n1)" ]; then
+    return 0
+  fi
+  log_warn "Generic install check: no binaries or libs found in $dest"
+  return 1
+}
+
+_check_firefox_build() {
+  local bd="$1"
+  local found=0
+  # common Firefox build outputs: obj-*/libxul.so, obj-*/libs/, browser/components, or client targets
+  if find "$bd" -type f -name "libxul.so" -print -quit 2>/dev/null | grep -q .; then found=1; fi
+  if find "$bd" -type f -name "firefox" -print -quit 2>/dev/null | grep -q .; then found=1; fi
+  if find "$bd" -type f -name "xul.dll" -print -quit 2>/dev/null | grep -q .; then found=1; fi
+  if [ "$found" -eq 1 ]; then return 0; fi
+  log_warn "Firefox build heuristic: no libxul or firefox binary found under $bd"
+  return 1
+}
+
+_check_firefox_install() {
+  local dest="$1"
+  local missing=()
+  # expected typical install paths
+  local paths=( "bin/firefox" "lib/libxul.so" "lib64/libxul.so" "browser/chrome" "browser" )
+  for p in "${paths[@]}"; do
+    if [ -e "$dest/$p" ]; then
+      return 0
+    fi
+  done
+  # try more heuristics (any ELF under lib or bin with firefox-like names)
+  if find "$dest" -type f \( -path "*/firefox" -o -path "*/libxul.so" -o -name "libxul.so" \) -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  log_error "Firefox install check failed: critical files not found under $dest (examples expected: bin/firefox, lib/libxul.so)"
+  return 1
+}
+
+_check_kde_build() {
+  local bd="$1"
+  # KDE is big; check for typical framework libs or kwin/plasma binaries
+  if find "$bd" -type f -name "libKF5*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$bd" -type f -name "kwin*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$bd" -type f -name "plasmashell" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  # fallback: any .so in subdirs
+  if find "$bd" -type f -name "*.so" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  log_warn "KDE build heuristic: no KF5 libs, kwin or plasmashell found under $bd"
+  return 1
+}
+
+_check_kde_install() {
+  local dest="$1"
+  # look for lib/libKF5* or usr/lib*/kf5 or bin/plasmashell or lib/kwin
+  if find "$dest" -type f -name "libKF5*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$dest" -type f -name "plasmashell" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$dest" -type f -name "kwin" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  # check for typical KDE frameworks directories
+  if [ -d "$dest/usr/lib/qt5/plugins" ] || [ -d "$dest/usr/lib64/qt5/plugins" ]; then return 0; fi
+  log_error "KDE install check failed: critical KDE artifacts not found under $dest"
+  return 1
+}
+
+_check_gnome_build() {
+  local bd="$1"
+  # check for gnome-shell binary, libgjs, gnome-desktop, mutter library names
+  if find "$bd" -type f -name "gnome-shell" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$bd" -type f -name "libmutter*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$bd" -type f -name "libgjs*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$bd" -type f -name "libgnome-desktop*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  # fallback: any .so found
+  if find "$bd" -type f -name "*.so" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  log_warn "GNOME build heuristic: no gnome-shell or mutter libs found under $bd"
+  return 1
+}
+
+_check_gnome_install() {
+  local dest="$1"
+  if find "$dest" -type f -path "*/gnome-shell" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$dest" -type f -name "libmutter*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  if find "$dest" -type f -name "libgjs*" -print -quit 2>/dev/null | grep -q .; then return 0; fi
+  log_error "GNOME install check failed: artifacts like gnome-shell or libmutter not found under $dest"
+  return 1
+}
+
+##### Finaliza log de etapa (mantive o comportamento anterior) #####
 log_end() {
   local code="${1-0}"
   local end_ts=$(_epoch)
@@ -280,7 +388,6 @@ log_end() {
     log_error "Stage ${LOGGER_CURRENT_STAGE}:${LOGGER_CURRENT_PKG} exited with code $code"
   fi
 
-  # Detect silent errors and artifacts problems
   if detect_silent_errors; then
     status="FAIL"
   fi
@@ -288,14 +395,11 @@ log_end() {
     status="FAIL"
   fi
 
-  # update meta.json final fields
   if [ -f "$meta" ]; then
-    # naive JSON update: replace RUNNING with final status and add end_time/duration
     tmp=$(mktemp)
     awk -v st="$status" -v et="$end_iso" -v d="$duration" '
       { gsub(/"status":"RUNNING"/, "\"status\":\"" st "\""); print }
     ' "$meta" > "$tmp" && mv "$tmp" "$meta"
-    # append end_time and duration if not present
     if ! grep -q '"end_time"' "$meta"; then
       tmp2=$(mktemp)
       awk -v et="$et" -v d="$d" '
@@ -305,7 +409,6 @@ log_end() {
     fi
   fi
 
-  # write summary entry into global summary.json (append)
   local summary_entry
   summary_entry=$(cat <<EOF
 {
@@ -318,9 +421,7 @@ log_end() {
 }
 EOF
 )
-  # insert into summary file array
   if [ -f "$SUMMARY_JSON" ]; then
-    # insert before final ]
     tmp=$(mktemp)
     awk -v entry="$summary_entry" '
       BEGIN{printed=0}
@@ -333,29 +434,24 @@ EOF
     ' "$SUMMARY_JSON" > "$tmp" && mv "$tmp" "$SUMMARY_JSON"
   fi
 
-  # DB status
   if [ -n "${LOGGER_CURRENT_PKG-}" ]; then
     log_set_status "$LOGGER_CURRENT_PKG" "$LOGGER_CURRENT_STAGE" "$status" "Exit code $code"
   fi
 
-  # print final message
   if [ "$status" = "SUCCESS" ]; then
     printf "%b[✓] %s:%s - SUCCESS (%ss)%b\n" "$COLOR_GREEN" "$LOGGER_CURRENT_STAGE" "$LOGGER_CURRENT_PKG" "$duration" "$COLOR_RESET"
   else
     printf "%b[✖] %s:%s - %s (%ss)%b\n" "$COLOR_RED" "$LOGGER_CURRENT_STAGE" "$LOGGER_CURRENT_PKG" "$status" "$duration" "$COLOR_RESET"
-    # if rollback configured -> attempt rollback
     if [ "${ROLLBACK_ON_FAIL}" = "yes" ]; then
       log_warn "Rollback enabled — attempting rollback for package ${LOGGER_CURRENT_PKG}"
       rollback_package "${LOGGER_CURRENT_PKG}"
     fi
-    # if STOP_ON_FAIL=yes, exit immediately with non-zero
     if [ "${STOP_ON_FAIL}" = "yes" ]; then
       echo "STOP_ON_FAIL=yes -> aborting controller" >&2
       exit 1
     fi
   fi
 
-  # optionally compress logs older than threshold (basic)
   if [ "${COMPRESS_OLD_LOGS}" = "yes" ]; then
     _compress_old_logs &
   fi
@@ -364,14 +460,12 @@ EOF
 }
 
 _compress_old_logs() {
-  # compress logs older than MAX_LOG_BACKUP_DAYS (background)
   find "$LOG_DIR" -type f -mtime +"$MAX_LOG_BACKUP_DAYS" -name "*.log" -print0 2>/dev/null | while IFS= read -r -d '' f; do
     gzip -9 -- "$f" 2>/dev/null || true
   done
 }
 
-##### Rollback implementation (heurística prática) #####
-# Tentativa de revert: usa backups armazenados em /var/lib/pkgdb/<pkg>/backup or packages cache
+##### Rollback implementation (permanece a mesma lógica utilizada anteriormente) #####
 rollback_package() {
   local pkg="$1"
   local pkgdb="$DB_DIR/$pkg"
@@ -382,27 +476,22 @@ rollback_package() {
   fi
   if [ -d "$backup_dir" ] && [ -n "$(ls -A "$backup_dir" 2>/dev/null)" ]; then
     log_info "Found backups in $backup_dir. Attempting restore..."
-    # try to find a tarball artifact (artifact may be packages/<pkg>/pkgname-version.tar.xz)
     for f in "$backup_dir"/*.{tar.xz,tar.zst,tar.gz,tar} 2>/dev/null; do
       [ -f "$f" ] || continue
       log_info "Restoring package from backup $f"
-      # perform uninstall of current version if files.list exists
       if [ -f "$pkgdb/files.list" ]; then
         while IFS= read -r p; do
           rm -f "$p" 2>/dev/null || true
-          # cleanup empty dirs
           dir=$(dirname "$p")
           rmdir --ignore-fail-on-non-empty "$dir" 2>/dev/null || true
         done < "$pkgdb/files.list"
         log_info "Removed files from current installation based on files.list"
       fi
-      # extract backup into / (requires root or simulator). Instead extract to temp and then copy
       tmpd=$(mktemp -d)
       case "$f" in
         *.tar.zst) tar -I zstd -xf "$f" -C "$tmpd" 2>/dev/null || tar -xf "$f" -C "$tmpd" ;;
         *) tar -xf "$f" -C "$tmpd" ;;
       esac
-      # move files to root with fakeroot ideally; here we attempt safe copy
       if [ -d "$tmpd" ]; then
         (cd "$tmpd" && rsync -aH --numeric-ids . /) 2>/dev/null || {
           log_warn "rsync to / failed (permission?). Try manual inspection of $tmpd"
@@ -410,11 +499,9 @@ rollback_package() {
         rm -rf "$tmpd"
       fi
       log_info "Rollback for $pkg from $f attempted (check logs and file system)."
-      # update DB status
       log_set_status "$pkg" "rollback" "SUCCESS" "Rolled back using $f"
       return 0
     done
-    # if here, no supported archive found
     log_warn "No supported backup archive found in $backup_dir"
     return 2
   else
@@ -423,17 +510,14 @@ rollback_package() {
   fi
 }
 
-##### Public helper: force compress and rotate logs #####
 rotate_logs() {
   if [ "${KEEP_LOGS}" != "yes" ]; then
     find "$LOG_DIR" -type f -name "*.log" -exec gzip -9 {} \; 2>/dev/null || true
   fi
 }
 
-##### Trap for unexpected errors in this script #####
 _trap_err() {
   local rc=$?
-  # if inside a package context, mark failure
   if [ -n "${LOGGER_CURRENT_PKG-}" ]; then
     log_error "Internal logger script error (rc=$rc). See ${LOGGER_CURRENT_ERR-}"
     log_set_status "$LOGGER_CURRENT_PKG" "$LOGGER_CURRENT_STAGE" "FAIL" "Logger internal error rc=$rc"
@@ -443,25 +527,3 @@ _trap_err() {
   exit $rc
 }
 trap '_trap_err' ERR
-
-##### Usage example (documentação embutida) #####
-# Exemplo de integração no script de build:
-# source /path/to/logger.sh
-# log_init
-# log_start build firefox
-# build commands >> "$LOGGER_CURRENT_OUT" 2>> "$LOGGER_CURRENT_ERR" || true
-# log_end $?
-#
-# Observações:
-# - Os outros scripts devem redirecionar stdout e stderr para
-#   ${LOGGER_CURRENT_OUT} e ${LOGGER_CURRENT_ERR}, respectivamente.
-# - DESTDIR, BUILD_DIR e outras variáveis de contexto podem ser exportadas
-#   antes de chamar log_start para serem usadas por check_artifacts.
-#
-# Exemplo curto:
-# log_start "build" "bc"
-# ( ./configure --prefix=/usr >> "$LOGGER_CURRENT_OUT" 2>> "$LOGGER_CURRENT_ERR" &&
-#   make -j$(nproc) >> "$LOGGER_CURRENT_OUT" 2>> "$LOGGER_CURRENT_ERR" ) || true
-# log_end $?
-
-# fim do arquivo
