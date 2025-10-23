@@ -1,0 +1,602 @@
+SISTEMA DE CONSTRUÇÃO COMPLETO - DESCRIÇÃO DOS SCRIPTS
+=======================================================
+
+OBJETIVO:
+---------
+Este conjunto de scripts shell simples é capaz de construir todo um sistema completo,
+incluindo pacotes complexos como KDE, GNOME e Firefox, em ordem correta, com logs,
+dependências, e automação total.
+
+Cada script tem uma função isolada e bem definida. Todos juntos formam o motor de
+compilação completo.
+
+
+-------------------------------------------------------
+1. config.txt
+-------------------------------------------------------
+Arquivo único de configuração global, texto simples.
+Contém todas as variáveis e caminhos usados pelo sistema.
+
+DEVE CONTER:
+- Diretórios (sources, build, logs, output) e o diretório de .desc /usr/src/repo (em subpastas)
+- Arquitetura (x86_64)
+- Quantidade de jobs paralelos
+- URLs de download de pacotes
+- Flags globais de compilação
+- Opções para limpeza e reexecução
+- Caminho do arquivo de lista de pacotes
+- Regras de reintentos em caso de falha
+- Diretório de toolchain (bootstrap)
+- Link do repositório git com os .desc,binários 
+
+
+-------------------------------------------------------
+2. 00-bootstrap
+-------------------------------------------------------
+Responsável por preparar o ambiente inicial.
+
+DEVE FAZER:
+- Verificar se o host tem ferramentas básicas (gcc, make, bash, tar, xz)
+- Criar diretórios padrões (sources, build, logs, output)
+- Compilar toolchain mínima (binutils, gcc, glibc) automaticamente usando os scripts
+- Configurar PATH e variáveis para o ambiente de build
+- Registrar logs e erros da etapa
+- Garantir ambiente limpo e reprodutível
+
+
+-------------------------------------------------------
+3. 01-fetch
+-------------------------------------------------------
+Baixa e valida as fontes dos pacotes.
+
+DEVE FAZER:
+- Ler lista de pacotes ou arquivos .desc
+- Baixar os tarballs originais de cada pacote
+- Verificar integridade via SHA256 ou GPG
+- Evitar re-downloads se já existe e válido (cache de fontes)
+- Registrar logs de tempo e status
+- Tratar falhas de rede com reintento automático
+- Baixar .desc ou binários do repositório git para /usr/src/repo
+
+
+-------------------------------------------------------
+4. 02-extract
+-------------------------------------------------------
+Prepara o código-fonte para compilação.
+
+DEVE FAZER:
+- Extrair o pacote para o diretório temporário
+- Aplicar patches (se houver)
+- Garantir limpeza de diretório anterior
+- Registrar logs da extração
+- Preparar o ambiente (variáveis, permissões)
+
+
+-------------------------------------------------------
+5. 03-depsolve
+-------------------------------------------------------
+Resolve todas as dependências antes de compilar.
+
+DEVE FAZER:
+- Ler dependências (diretas e indiretas) dos pacotes
+- Construir grafo de dependências completo (DAG)
+- Detectar e impedir dependências circulares
+- Gerar lista de build em ordem topológica
+- Registrar mapa de dependências e sequência de build
+- Permitir dependências opcionais controladas por flags
+- Ordenar corretamente pacotes complexos como KDE, GNOME e Firefox
+
+
+-------------------------------------------------------
+6. 04-build
+-------------------------------------------------------
+Executa a compilação dos pacotes em ordem correta.
+
+DEVE FAZER:
+- Ler ordem gerada pelo depsolve
+- Entrar no diretório de build de cada pacote
+- Detectar tipo de build (autotools, cmake, meson, custom)
+- Executar hooks de pré/pos prepare,configure,build (automaticamente se estiverem dentro da pasta hooks na pasta do programa)
+- Executar etapas padrão: configure → build (make/ninja)
+- Utilizar variáveis globais (CFLAGS, LDFLAGS, MAKEFLAGS)
+- Suportar builds paralelos e retomáveis
+- Registrar logs e status de compilação
+- Parar em falha e marcar dependentes como bloqueados
+
+
+-------------------------------------------------------
+7. 05-install
+-------------------------------------------------------
+Instala o pacote compilado em ambiente isolado (DESTDIR) com fakeroot.
+
+DEVE FAZER:
+- Criar DESTDIR temporário
+- Rodar “make install” ou equivalente
+- Garantir que nada é instalado fora do ambiente isolado
+- Validar estrutura final (bin, lib, include, share)
+- Gerar lista de arquivos instalados
+- Registrar logs de instalação
+Opção de instalar binários do cache ou diretórios locais ou do repo git
+
+
+-------------------------------------------------------
+8. 06-package
+-------------------------------------------------------
+Empacota o resultado da instalação em um arquivo final e strip.
+
+DEVE FAZER:
+- Compactar o DESTDIR em tarball (.tar.xz ou .tar.zst)
+- Gerar metadados (nome, versão, hash, tamanho, data)
+- Salvar em diretório de cache
+- Registrar logs e manifestos
+- Atualizar banco de pacotes construídos
+
+
+-------------------------------------------------------
+9. 07-logger
+-------------------------------------------------------
+Gerencia todos os logs e metadados de build.
+
+DEVE FAZER:
+- Criar um log por pacote e fase
+- Gravar data, duração e resultado (SUCCESS/FAIL)
+- Manter log mestre com resumo global
+- Armazenar JSONs ou texto legível
+- Gerar relatório final com pacotes construídos, falhas e tempos
+
+
+-------------------------------------------------------
+10. 08-clean
+-------------------------------------------------------
+Mantém o ambiente limpo e previsível.
+
+DEVE FAZER:
+- Apagar diretórios temporários de build antigos
+- Preservar fontes e artefatos válidos
+- Compactar logs antigos
+- Recriar estrutura básica quando necessário
+- Garantir que um rebuild começa limpo
+
+-------------------------------------------------------
+11. 09-uninstall
+-------------------------------------------------------
+Função: remover um pacote previamente instalado.
+
+Passos:
+
+1. Recebe o nome do pacote (ex: "pkg uninstall firefox").
+2. Verifica no banco de pacotes instalados:
+       /var/lib/pkgdb/firefox/files.list
+   Este arquivo contém todos os caminhos instalados pelo pacote.
+
+3. Lê e remove cada arquivo listado.
+4. Remove diretórios vazios relacionados.
+5. Atualiza banco de dados:
+       remove /var/lib/pkgdb/firefox/
+6. Registra log em:
+       /var/log/pkg/uninstall/firefox.log
+7. Opcionalmente executa hook post-uninstall:
+       /hooks/post-uninstall/firefox
+
+
+Resumo:
+- Operação reversa da instalação
+- Não toca em dependências automaticamente (mantém segurança)
+- Remove apenas o que o pacote adicionou
+
+------------------------------------------------------------------
+12. 10-update
+------------------------------------------------------------------
+Função: atualizar pacotes de forma estável e previsível.
+
+Fluxo detalhado:
+
+1. Recebe nome do pacote (ex: "pkg update firefox").
+2. Localiza o arquivo .desc correspondente:
+       package/www/firefox/firefox.desc
+3. Lê os campos:
+       NAME, VERSION, URL, SHA256
+4. Acessa a URL base do tarball ou repositório oficial.
+   Exemplo: https://ftp.mozilla.org/pub/firefox/releases/
+
+5. Busca as versões disponíveis.
+6. Compara com a versão atual:
+       - Se existir uma versão MAIOR (ex: 118 → 119), propõe atualização.
+       - Ignora versões menores, betas, nightlies, etc.
+         Isso garante estabilidade (só avança versão principal).
+
+7. Baixa o novo tarball temporariamente.
+8. Calcula SHA256 da nova versão.
+9. Atualiza automaticamente o .desc:
+       - Substitui VERSION, URL e SHA256
+       - Mantém BUILD_DEPS, RUN_DEPS e outros campos
+10. Salva backup do .desc antigo em:
+       package/www/firefox/firefox.desc.bak
+11. Executa uma reconstrução automática:
+       pkg rebuild firefox
+12. Gera logs detalhados:
+       /var/log/pkg/update/firefox.log
+
+
+4. POLÍTICA DE ESTABILIDADE
+----------------------------
+A regra de atualização é simples:
+
+- Só atualiza quando:
+     nova_versão > versão_atual  (mudança de major)
+- Não atualiza se:
+     nova_versão é beta, rc, nightly, ou patch menor.
+
+Isso garante que o sistema se mantenha estável, previsível e coerente.
+
+
+5. INTEGRAÇÃO COM OS OUTROS SCRIPTS
+------------------------------------
+update-pkg depende dos seguintes scripts:
+
+   - fetch (para baixar a nova fonte)
+   - extract (para preparar o build)
+   - build/install/package (para reconstruir)
+   - uninstall (para remover versão antiga antes de instalar nova)
+
+Fluxo automático:
+   update → uninstall(old) → build(new) → install(new)
+
+
+6. LOGS E CONTROLE
+-------------------
+Cada operação (update/uninstall) cria logs completos:
+   /var/log/pkg/update/$PKG.log
+   /var/log/pkg/uninstall/$PKG.log
+
+E registra o estado no banco de pacotes:
+   /var/lib/pkgdb/$PKG/status
+   Campos: version, build_date, installed_files
+
+
+7. BENEFÍCIOS DO MÉTODO
+------------------------
+✔ Atualizações seguras e estáveis  
+✔ Sem necessidade de rastrear repositórios git  
+✔ Compatível com o formato .desc existente  
+✔ Totalmente automatizável  
+✔ Mantém histórico e rollback simples  
+✔ Ideal para sistemas de compilação estáveis (como T2, LFS, BLFS)
+
+DEPENDÊNCIAS EM ATUALIZAÇÃO DE PACOTES
+======================================
+
+1. PROBLEMA PRINCIPAL
+---------------------
+Quando você atualiza um pacote, as dependências dele podem:
+
+- Não ter mudado → tudo ok
+- Ter uma versão mínima maior → pode ser necessário atualizar também
+- Ter mudado de forma incompatível → pode quebrar outros pacotes que dependem da versão antiga
+
+Exemplo: Firefox 118 → 119
+- Firefox 119 pode exigir Rust >= 1.77
+- Se a versão antiga do Rust era 1.76, você precisa atualizar Rust primeiro
+
+Portanto, **não basta atualizar só o pacote** — precisa checar todas as dependências.
+
+
+2. FLUXO DE DEPENDÊNCIAS DURANTE UPDATE
+----------------------------------------
+Ao executar `pkg update <pacote>`:
+
+1. Lê o .desc atual do pacote
+2. Busca a nova versão estável no mainstream
+3. Baixa ou valida tarball + SHA256
+4. Antes de build:
+   - O script **depsolve** é chamado novamente, **agora usando a versão nova**
+   - Verifica:
+       a) Todas as BUILD_DEPS atendidas
+       b) RUN_DEPS compatíveis
+5. Para qualquer dependência que precise ser atualizada, o sistema:
+   - Adiciona na fila de atualização
+   - Executa update dessas dependências **antes do pacote principal**
+6. Após dependências corretas, atualiza o pacote principal
+7. Opcional: mantém registro das versões antigas (rollback)
+
+
+3. COMO LIDAR COM DEPENDÊNCIAS DE VERSÃO ANTERIOR
+---------------------------------------------------
+- Cada pacote mantém no banco local:
+      installed.db:
+        - NAME
+        - VERSION
+        - BUILD_DEPS
+        - RUN_DEPS
+
+- Quando o update detecta que a nova versão exige dependências maiores:
+      - Verifica banco local
+      - Se a dependência atual < exigida:
+          → agenda atualização da dependência primeiro
+      - Se a dependência atual >= exigida:
+          → não faz nada, mantém
+
+- Isso garante que **dependências da versão anterior** não bloqueiem o update,
+  mas também não quebra pacotes que dependem dela.
+
+
+4. ESTRATÉGIA DE ESTABILIDADE
+------------------------------
+- Só atualiza dependências se necessário (min_version > versão atual)
+- Mantém pacotes não afetados intactos
+- Pode criar "locks" para versões críticas (ex: GTK ou glib)
+- Permite reconstrução em ordem topológica correta: dependência → pacote dependente
+
+
+5. FLUXO COMPLETO DE UPDATE COM DEPENDÊNCIAS
+--------------------------------------------
+pkg update firefox
+ ├─> lê firefox.desc
+ ├─> busca nova versão estável
+ ├─> atualiza .desc temporário
+ ├─> depsolve(build_deps + run_deps da nova versão)
+ │     ├─> detecta que Rust precisa ser >=1.77
+ │     ├─> agenda update rustc antes
+ │     └─> agenda update gtk3, dbus se necessário
+ ├─> executa updates das dependências em ordem correta
+ ├─> build nova versão do firefox
+ ├─> install nova versão
+ ├─> hooks pós-build/pós-install
+ └─> log completo + backup .desc antigo
+
+
+6. RESUMO
+----------
+✔ Dependências da versão antiga não bloqueiam update  
+✔ O sistema resolve **automaticamente** dependências mínimas da versão nova  
+✔ Ordem topológica garante que nada quebre  
+✔ Logs e backup permitem rollback se algo falhar  
+✔ Funciona para pacotes complexos como Firefox, KDE ou GNOME  
+
+Conclusão:
+- Sim, funciona com dependências da versão anterior, desde que o update **verifique os requisitos mínimos da nova versão** antes de compilar.
+- Esse é o comportamento adotado por gerenciadores de pacotes robustos (ex: Portage, pkgsrc, Gentoo, FreeBSD ports).
+
+-------------------------------------------------------
+FIM DO DOCUMENTO
+-------------------------------------------------------
+
+
+8. EXEMPLO DE ATUALIZAÇÃO
+--------------------------
+Antes:
+   VERSION = 118.0
+   URL = https://ftp.mozilla.org/pub/firefox/releases/118.0/source/firefox-118.0.tar.xz
+   SHA256 = abcd123...
+
+Após "pkg update firefox":
+   VERSION = 119.0
+   URL = https://ftp.mozilla.org/pub/firefox/releases/119.0/source/firefox-119.0.tar.xz
+   SHA256 = efg987...
+
+
+9. HOOKS OPCIONAIS
+-------------------
+Para integração total, o sistema pode suportar hooks adicionais:
+
+   /hooks/pre-update/$PKG
+   /hooks/post-update/$PKG
+   /hooks/post-uninstall/$PKG
+
+Exemplo:
+   pre-update/firefox → limpa cache antigo de builds
+   post-update/firefox → atualiza MIME, desktop-db, etc.
+
+
+10. RESUMO FINAL
+----------------
+Os novos scripts expandem o sistema para gerenciar ciclo completo:
+
+   BUILD → INSTALL → UPDATE → UNINSTALL
+
+Com estabilidade garantida via comparação de versão MAIOR e
+automação total do .desc.
+
+Fluxo visual:
+
+pkg update firefox
+ ├─> lê firefox.desc
+ ├─> busca nova versão (estável)
+ ├─> baixa tarball
+ ├─> atualiza .desc
+ ├─> uninstall versão antiga
+ ├─> build nova versão
+ ├─> install nova versão
+ ├─> executa hooks
+ └─> log completo + backup .desc
+
+
+-------------------------------------------------------
+11. 11-controller
+-------------------------------------------------------
+O “cérebro” do sistema — orquestra todas as fases automaticamente.
+
+DEVE FAZER:
+- Ler config.txt e validar variáveis
+- Chamar scripts na sequência:
+- bootstrap → fetch → extract → depsolve → build → install → package → clean
+- Controlar dependências e status entre fases
+- Reexecutar automaticamente etapas falhas se permitido
+- Registrar progresso global e erros
+- Gerar relatório final com:
+  - Tempo total
+  - Pacotes construídos
+  - Falhas
+  - Logs de referência
+
+----------------------------------------------------------
+ Estrutura Exemplo de um master.conf
+----------------------------------------------------------
+ROOT = ./auto-builder
+ARCH = x86-64
+MODE = native
+PARALLELISM = 2
+SRC_DIR = ${ROOT}/sources
+WORK_DIR = ${ROOT}/work
+ARTIFACT_DIR = ${ROOT}/artifacts
+LOG_DIR = ${ROOT}/logs
+DB_DIR = ${ROOT}/db
+PKG_DIR = ${ROOT}/packages
+MIRRORS = https://ftp.gnu.org/gnu
+RETRY_LIMIT = 2
+RETRY_BACKOFF = 5
+CFLAGS = -O2 -pipe
+MAKEFLAGS = -j2
+CLEAN_ON_START = no
+KEEP_LOGS = yes
+ALLOW_CROSS = false
+BOOTSTRAP_MODE = auto
+TAR_BIN = tar
+ZSTD_BIN = zstd
+
+-------------------------------------------------------
+12. Estrutura de pacotes (.desc)
+-------------------------------------------------------
+Cada pacote é descrito em arquivo simples texto:
+
+DEVE CONTER:
+- NAME, VERSION, URL, SHA256
+- BUILD_DEPS (dependências de compilação)
+- RUN_DEPS (dependências de execução)
+- BUILD_HINT (tipo de build: autotools, cmake, meson)
+- COMMENT (descrição)
+- CATEGORY (diretório específico: core, libs, desktop, apps, xorg, extras, bootstrap, www)
+- STAGE (stagios: stage1, stage2, stage3)
+- OPTIONS (opcionais, ex: wayland, pulseaudio)
+
+Esses arquivos são usados pelo 01-fetch e 03-depsolve.
+
+
+-------------------------------------------------------
+13. Fluxo Completo de Execução
+-------------------------------------------------------
+controller
+ ├─> 00-bootstrap   → cria ambiente base
+ ├─> 01-fetch       → baixa fontes
+ ├─> 02-extract     → prepara código
+ ├─> 03-depsolve    → gera ordem de build
+ ├─> 04-build       → compila pacotes
+ ├─> 05-install     → instala isoladamente
+ ├─> 06-package     → empacota resultados
+ ├─> 07-logger      → registra e resume tudo
+ ├─> 08-clean       → limpa e encerra
+ ├─> 09-uninstall   → remover um pacote previamente instalado.
+ └─> 10-update.     → atualizar pacotes de forma estável e previsível do mainstream.
+
+
+-------------------------------------------------------
+14. RESULTADO FINAL
+-------------------------------------------------------
+Este conjunto mínimo de scripts é suficiente para:
+
+- Construir uma base completa (LFS + BLFS)
+- Resolver e compilar todas as dependências do KDE e GNOME
+- Compilar Firefox e outros grandes projetos (autônomo)
+- Manter logs e manifestos reprodutíveis
+- Funcionar com apenas um arquivo config.txt e scripts shell simples
+
+
+-------------------------------------------------------
+EXEMPLO DE PACOTE .DESC - "bc"
+==============================
+
+Arquivo: package/base/bc/bc.desc
+
+-----------------------------------
+NAME = bc
+VERSION = 1.08.2
+URL = https://ftp.gnu.org/gnu/$NAME/$NAME-$VERSION.tar.xz
+SHA256 = 76e3a9531c7764bd13c600c1e016e6760d9b8379ba06d1ecc08d5a68
+BUILD_DEPS = readline
+RUN_DEPS =
+BUILD_HINT = autotools
+STAGE = 2
+PRIORITY = normal
+CATEGORY = base
+-----------------------------------
+
+
+SIGNIFICADO DOS CAMPOS
+----------------------
+NAME ........ Nome do pacote
+VERSION ..... Versão a ser construída
+URL ......... Local do tarball original
+SHA256 ...... Verificação de integridade do tarball
+BUILD_DEPS .. Dependências necessárias para compilar
+RUN_DEPS .... Dependências de execução (vazias aqui)
+BUILD_HINT .. Indica o tipo de build usado (autotools, cmake, meson, custom)
+STAGE ....... Ordem geral do sistema (1 = base, 2 = libs, 3 = apps)
+PRIORITY .... Define a prioridade de execução na fila (normal, low, high)
+
+Observação: Se BUILD_HINT = custom (usar uma função BUILD_HINT para fazer a construcao customizada do programa no .desc,quando nao selecionado em BUILD_HINT e opcional e pode ser ocultada do .desc.
+
+
+COMPORTAMENTO DO SISTEMA
+------------------------
+1. O script **01-fetch** lê este .desc:
+   - Baixa o tarball do campo URL.
+   - Verifica o hash SHA256.
+   - Armazena em sources/bc-1.08.2.tar.xz.
+
+2. O script **02-extract** extrai o pacote:
+   - Cria diretório build/bc-1.08.2.
+   - Extrai o código-fonte dentro dele.
+
+3. O script **03-depsolve** lê "BUILD_DEPS=readline":
+   - Resolve que o pacote "readline" precisa ser construído antes de "bc".
+   - Adiciona bc após readline na fila de build.
+
+4. O script **04-build** faz:
+   - Detecta "BUILD_HINT=autotools".
+   - Executa os comandos padrão:
+        ./configure --prefix=/usr
+        make -j$(nproc)
+        make install DESTDIR=$DESTDIR
+   - Gera logs em logs/bc.log.
+
+5. O script **06-package** empacota:
+   - Compacta o DESTDIR em output/bc-1.08.2.tar.xz.
+   - Cria manifest com lista de arquivos e hash.
+
+6. Nenhuma função "build()" é usada, pois o sistema detectou
+   que "BUILD_HINT=autotools" e aplicou o modo padrão.
+
+
+RESUMO
+------
+Este .desc representa o caso mais simples possível:
+- Pacote básico
+- Nenhum comportamento especial
+- Totalmente automatizável
+- Compilação via autotools padrão
+- Dependência única (readline)
+- Nenhuma função customizada necessária
+
+Isso garante que o motor do sistema trate o pacote
+como parte da base essencial do sistema (Stage 1).
+
+
+FLUXO VISUAL
+-------------
+controller
+ └─> fetch(bc)
+     └─> extract(bc)
+         └─> depsolve(readline)
+             └─> build(bc) [autotools padrão]
+                 └─> install(bc)
+                     └─> package(bc)
+                         └─> done ✅
+
+
+-------------------------------------------------------
+FIM DO DOCUMENTO
+-------------------------------------------------------
+
+
+FIM DO ARQUIVO
+-------------------------------------------------------
