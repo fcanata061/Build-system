@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# post-build hook for firefox: checks artifacts and compresses logs
+set -euo pipefail
+pkg="firefox"
+ROOT="${ROOT:-./auto-builder}"
+BUILD_DIR="${BUILD_DIR:-${ROOT}/build}"
+LOG_OUT="${LOGGER_CURRENT_OUT:-${ROOT}/logs/build/${pkg}.out}"
+LOG_ERR="${LOGGER_CURRENT_ERR:-${ROOT}/logs/build/${pkg}.err}"
+SILENT_PATTERNS="${SILENT_PATTERNS:-error|failed|fatal|undefined reference|segmentation fault}"
+
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "post-build failed (rc=$rc)" >>"$LOG_ERR"; fi; exit $rc' EXIT
+
+_log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >>"$LOG_OUT"; }
+_err() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] ERROR: $*" >>"$LOG_ERR"; }
+
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] post-build start" >>"$LOG_OUT"
+
+# 1) Verify critical artifacts (heuristics)
+ARTIFACTS=( "lib/libxul.so" "browser/firefox" "browser" )
+missing=()
+for a in "${ARTIFACTS[@]}"; do
+  if [ ! -e "${BUILD_DIR}/${pkg}/${a}" ]; then
+    missing+=("$a")
+  fi
+done
+if [ "${#missing[@]}" -ne 0 ]; then
+  _err "Critical artifacts missing for $pkg: ${missing[*]}"
+  # keep logs and mark as failure (04-build.sh will mark package FAIL)
+  exit 6
+fi
+_log "All critical artifacts present"
+
+# 2) Strip debug symbols optionally (safe): try to strip only if binaries exist
+if command -v strip >/dev/null 2>&1; then
+  find "${BUILD_DIR}/${pkg}" -type f -perm -111 -exec strip --strip-unneeded {} \; >>"$LOG_OUT" 2>>"$LOG_ERR" || _log "strip produced warnings (non-fatal)"
+fi
+
+# 3) Collect build size metrics
+total_size=$(du -sh "${BUILD_DIR}/${pkg}" 2>/dev/null | cut -f1 || echo "unknown")
+_log "Build directory size: $total_size"
+
+# 4) Compress per-package logs older than X days (example immediate compression)
+if [ -f "$LOG_OUT" ]; then
+  gzip -9 -c "$LOG_OUT" > "${LOG_OUT}.gz" && mv -f "${LOG_OUT}.gz" "$LOG_OUT" || _log "Failed to compress stdout log"
+fi
+if [ -f "$LOG_ERR" ]; then
+  gzip -9 -c "$LOG_ERR" > "${LOG_ERR}.gz" && mv -f "${LOG_ERR}.gz" "$LOG_ERR" || _log "Failed to compress stderr log"
+fi
+
+_log "post-build done"
+exit 0
