@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# health-check hook: valida binários e bibliotecas após o build (sem instalar)
+set -euo pipefail
+pkg="firefox"
+ROOT="${ROOT:-./auto-builder}"
+BUILD_DIR="${BUILD_DIR:-${ROOT}/build}"
+PKG_DIR="${BUILD_DIR}/${pkg}"
+LOG_OUT="${LOGGER_CURRENT_OUT:-${ROOT}/logs/build/${pkg}.out}"
+LOG_ERR="${LOGGER_CURRENT_ERR:-${ROOT}/logs/build/${pkg}.err}"
+PKGDB_DIR="${PKGDB_DIR:-/var/lib/pkgdb}"
+SILENT_PATTERNS="${SILENT_PATTERNS:-error|failed|undefined reference|segmentation fault|core dumped|fatal}"
+STATUS="HEALTH_OK"
+
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "health-check failed (rc=$rc)" >>"$LOG_ERR"; fi; exit $rc' EXIT
+
+_log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >>"$LOG_OUT"; }
+_err() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] ERROR: $*" >>"$LOG_ERR"; }
+
+_log "Starting health-check for $pkg"
+
+# 1️⃣ - Checa se os principais binários existem e são executáveis
+MAIN_BIN="${PKG_DIR}/browser/firefox"
+if [ ! -x "$MAIN_BIN" ]; then
+  _err "Main binary not found or not executable: $MAIN_BIN"
+  STATUS="HEALTH_FAIL"
+else
+  _log "Binary found: $MAIN_BIN"
+fi
+
+# 2️⃣ - Tenta executar com --version (teste seguro)
+if [ "$STATUS" != "HEALTH_FAIL" ]; then
+  timeout 10s "$MAIN_BIN" --version >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+    _err "Binary execution failed (possibly segfault or missing lib)"
+    STATUS="HEALTH_FAIL"
+  }
+fi
+
+# 3️⃣ - Verifica dependências dinâmicas com ldd
+if command -v ldd >/dev/null 2>&1 && [ -x "$MAIN_BIN" ]; then
+  missing_libs=$(ldd "$MAIN_BIN" 2>/dev/null | grep "not found" || true)
+  if [ -n "$missing_libs" ]; then
+    _err "Missing libraries detected:\n$missing_libs"
+    STATUS="HEALTH_FAIL"
+  else
+    _log "Dynamic dependencies OK (ldd passed)"
+  fi
+else
+  _log "Skipping ldd check (not available)"
+fi
+
+# 4️⃣ - Verifica arquivos ELF truncados ou vazios
+broken_files=()
+while IFS= read -r file; do
+  # ignora diretórios
+  [ -f "$file" ] || continue
+  # verifica ELF header
+  if ! head -c 4 "$file" | grep -q "ELF"; then
+    continue
+  fi
+  size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+  if [ "$size" -lt 4096 ]; then
+    broken_files+=("$file")
+  fi
+done < <(find "$PKG_DIR" -type f -perm -111 2>/dev/null || true)
+if [ "${#broken_files[@]}" -gt 0 ]; then
+  _err "Detected possibly broken ELF files: ${broken_files[*]}"
+  STATUS="HEALTH_WARN"
+fi
+
+# 5️⃣ - Detecta erros silenciosos no log
+if grep -Ei "$SILENT_PATTERNS" "$LOG_ERR" >/dev/null 2>&1; then
+  _err "Silent error patterns found in stderr"
+  STATUS="HEALTH_WARN"
+fi
+
+# 6️⃣ - Verifica tamanho total (sanity check)
+build_size=$(du -sm "$PKG_DIR" 2>/dev/null | cut -f1 || echo 0)
+if [ "$build_size" -lt 100 ]; then
+  _err "Build directory too small (${build_size}MB) — suspicious"
+  STATUS="HEALTH_WARN"
+fi
+
+# 7️⃣ - Atualiza pkgdb com status final
+pkgdb="$PKGDB_DIR/$pkg"
+mkdir -p "$pkgdb"
+cat > "$pkgdb/health.status" <<EOF
+PKG=$pkg
+CHECK_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+RESULT=$STATUS
+EOF
+
+# 8️⃣ - Mensagem final e exit code
+case "$STATUS" in
+  HEALTH_OK)
+    _log "Health check passed ✅"
+    ;;
+  HEALTH_WARN)
+    _err "Health check passed with warnings ⚠️"
+    ;;
+  HEALTH_FAIL)
+    _err "Health check failed ❌"
+    ;;
+esac
+
+# Retorna 0 para OK/WARN, 1 para FAIL (permitindo abortar build-chain se desejado)
+if [ "$STATUS" = "HEALTH_FAIL" ]; then
+  exit 1
+else
+  exit 0
+fi
