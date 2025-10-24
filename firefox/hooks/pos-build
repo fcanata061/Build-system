@@ -49,3 +49,4 @@ fi
 
 _log "post-build done"
 exit 0
+run_hooks "$pkg" "health-check"
