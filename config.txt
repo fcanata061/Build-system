@@ -1,0 +1,126 @@
+###############################################################################
+# PKG BUILD SYSTEM CONFIGURATION
+# Global configuration file for pkg CLI and scripts 00–11
+# Location: /etc/pkg/config.txt
+###############################################################################
+
+# =============================================================================
+# GENERAL PATHS
+# =============================================================================
+REPO_ROOT="/usr/src/repo"             # root of package sources (.desc)
+SRC_DIR="${REPO_ROOT}/sources"        # downloaded tarballs
+BUILD_DIR="${REPO_ROOT}/build"        # temporary build directories
+OUTPUT_DIR="${REPO_ROOT}/packages"    # final packaged archives
+PKGDB_DIR="/var/lib/pkgdb"            # database of installed packages
+LOG_DIR="/var/log/pkg"                # all logs stored here
+CACHE_DIR="/var/cache/pkg"            # for downloads, manifests, etc.
+HOOKS_DIR="${REPO_ROOT}/hooks"        # global hooks (pre/post actions)
+
+# =============================================================================
+# SYSTEM POLICIES
+# =============================================================================
+MAX_PARALLEL_JOBS=8                   # max parallel build jobs
+MAX_FETCH_PARALLEL=4                  # parallel downloads
+TIMEOUT_PER_STAGE=3600                # timeout in seconds per build stage
+MAX_RETRY=3                           # default retry for network ops
+DEFAULT_MIRROR="https://ftp.gnu.org/gnu"
+ALLOW_ROOT_ONLY="yes"                 # restrict install/uninstall/update to root
+SAFE_MODE="yes"                       # stop on first critical failure
+
+# =============================================================================
+# LOGGING & OUTPUT
+# =============================================================================
+LOG_COLOR="yes"                       # enable colored terminal output
+LOG_VERBOSE="no"                      # print verbose logs to stdout
+LOG_TIMESTAMP="yes"                   # include timestamps
+LOG_ROTATE_KEEP=10                    # keep last N rotated logs
+BUILD_REPORT="${LOG_DIR}/controller/report.txt"
+BUILD_JSON="${LOG_DIR}/controller/status.json"
+
+# =============================================================================
+# COMPILATION FLAGS
+# =============================================================================
+CFLAGS="-O2 -pipe"
+CXXFLAGS="-O2 -pipe"
+LDFLAGS="-Wl,-O1 -Wl,--as-needed"
+MAKEFLAGS="-j$(nproc)"
+LANGUAGES="C C++"
+USE_CCACHE="no"
+
+# =============================================================================
+# ERROR HANDLING AND DETECTION
+# =============================================================================
+# Patterns of messages that indicate potential silent errors
+SILENT_ERROR_PATTERNS="segmentation fault|undefined reference|internal compiler error|core dumped|permission denied|I/O error"
+ROLLBACK_ON_FAILURE="yes"
+KEEP_LOGS_ON_FAIL="yes"
+NOTIFY_ON_FAIL="no"                   # can integrate with email/Slack later
+
+# =============================================================================
+# UPDATE POLICY
+# =============================================================================
+UPDATE_POLICY="major-only"            # major-only | all | none
+ALLOW_AUTO_DEPS_UPDATE="yes"
+BACKUP_DESC_ON_UPDATE="yes"
+KEEP_OLD_DESC_COUNT=3
+CHECKSUM_VERIFY="yes"
+
+# =============================================================================
+# REMOTE PUBLISH (for pkg publish / pkg install --publish)
+# =============================================================================
+REMOTE_MODE="rsync"                   # rsync | git
+REMOTE_TARGET="user@repo:/srv/repo"   # rsync target or git repo URL
+REMOTE_RETRY=3
+REMOTE_TIMEOUT=60
+REMOTE_COMPRESS="yes"
+
+# =============================================================================
+# ROLLBACK AND BACKUPS
+# =============================================================================
+BACKUP_DIR="${PKGDB_DIR}/.backups"
+DESC_BACKUP_SUFFIX=".bak"
+BACKUP_RETAIN_DAYS=10
+SNAPSHOT_SUPPORT="no"                 # enable if using btrfs/zfs snapshots
+
+# =============================================================================
+# SECURITY
+# =============================================================================
+VERIFY_SIGNATURES="no"                # set yes if using GPG-signed tarballs
+ALLOW_UNSAFE_PATHS="no"
+SANDBOX_BUILDS="no"                   # chroot/sandbox support (future)
+RUN_AS_USER="builder"
+
+# =============================================================================
+# MIRRORS AND NETWORK
+# =============================================================================
+MIRRORS=(
+  "https://ftp.gnu.org/gnu"
+  "https://mirrors.kernel.org/gnu"
+  "https://mirror.csclub.uwaterloo.ca/gnu"
+)
+NETWORK_TIMEOUT=30
+ALLOW_HTTP_FALLBACK="yes"
+USE_IPV6="yes"
+
+# =============================================================================
+# CONTROLLER BEHAVIOR
+# =============================================================================
+RETRY_FAILED_STAGES="yes"
+RESUME_ON_RESTART="yes"
+SKIP_CLEAN_ON_SUCCESS="yes"
+FINAL_REPORT="yes"
+
+# =============================================================================
+# CUSTOM HOOKS
+# =============================================================================
+# Hooks are scripts automatically called by controller or pkg
+# Example:
+#   /usr/src/repo/hooks/pre-update/<pkg>
+#   /usr/src/repo/hooks/post-install/<pkg>
+ENABLE_HOOKS="yes"
+
+# =============================================================================
+# INTERNAL MAINTENANCE
+# =============================================================================
+VERSION="1.0"
+CONFIG_LOADED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
