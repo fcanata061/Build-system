@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# pre-prepare hook for firefox
+set -euo pipefail
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "pre-prepare failed (rc=$rc)"; fi; exit $rc' EXIT
+
+pkg="firefox"
+ROOT="${ROOT:-./auto-builder}"
+LOG_OUT="${LOGGER_CURRENT_OUT:-${ROOT}/logs/build/${pkg}.out}"
+LOG_ERR="${LOGGER_CURRENT_ERR:-${ROOT}/logs/build/${pkg}.err}"
+SILENT_PATTERNS="${SILENT_PATTERNS:-error|failed|fatal|segmentation fault|core dumped|undefined reference}"
+
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] pre-prepare start" >>"$LOG_OUT"
+
+# helper: log and err
+_log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >>"$LOG_OUT"; }
+_err() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] ERROR: $*" >>"$LOG_ERR"; }
+
+# 1) Check minimum disk space (MB)
+MIN_FREE_MB=2000
+avail_mb=$(df -Pk "${ROOT}" | awk 'NR==2{print int($4/1024)}' || echo 0)
+if [ "$avail_mb" -lt "$MIN_FREE_MB" ]; then
+  _err "Insufficient disk space on ${ROOT}: ${avail_mb}MB (< ${MIN_FREE_MB}MB required)"
+  exit 2
+fi
+_log "Disk space OK: ${avail_mb}MB"
+
+# 2) Ensure toolchain available (gcc, python3, rust maybe)
+reqs=(gcc make python3 sed curl xz tar)
+missing=()
+for r in "${reqs[@]}"; do
+  command -v "$r" >/dev/null 2>&1 || missing+=("$r")
+done
+if [ "${#missing[@]}" -ne 0 ]; then
+  _err "Missing required tools: ${missing[*]}"
+  exit 3
+fi
+_log "Required tools present"
+
+# 3) Ensure source archive looks sane (quick mime check)
+src_archive="${SRC_DIR:-${ROOT}/sources}/${pkg}.tar.xz"
+if [ -f "$src_archive" ]; then
+  file "$src_archive" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+  # quick test: try tar -t
+  if ! tar -tf "$src_archive" > /dev/null 2>>"$LOG_ERR"; then
+    _err "Source archive appears corrupted: $src_archive"
+    exit 4
+  fi
+  _log "Source archive OK: $src_archive"
+else
+  _log "No source archive found for $pkg (maybe repo-based)."
+fi
+
+# 4) Clear build caches that commonly cause rebuild breakage (with retries)
+caches=(~/.cache/mozilla ~/.mozbuild)
+for c in "${caches[@]}"; do
+  if [ -d "$c" ]; then
+    tries=0
+    while [ $tries -lt 3 ]; do
+      rm -rf "$c" && break || {
+        _log "Failed to remove $c attempt $((tries+1))"
+        sleep $((tries+1))
+        tries=$((tries+1))
+      }
+    done
+    _log "Cleared cache: $c"
+  fi
+done
+
+# 5) Final check for silent patterns in recent system logs (optional)
+if [ -f "$LOG_ERR" ] && grep -Ei "$SILENT_PATTERNS" "$LOG_ERR" >/dev/null 2>&1; then
+  _log "Detected previous silent patterns in log (non-fatal here)"
+fi
+
+_log "pre-prepare done"
+exit 0
