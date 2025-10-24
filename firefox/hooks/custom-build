@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# custom-build hook: firefox-specific complex build steps
+# This script is executed instead of the standard configure/compile steps.
+set -euo pipefail
+pkg="firefox"
+ROOT="${ROOT:-./auto-builder}"
+LOG_OUT="${LOGGER_CURRENT_OUT:-${ROOT}/logs/build/${pkg}.out}"
+LOG_ERR="${LOGGER_CURRENT_ERR:-${ROOT}/logs/build/${pkg}.err}"
+SILENT_PATTERNS="${SILENT_PATTERNS:-error|failed|fatal|undefined reference}"
+
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "custom-build failed (rc=$rc)" >>"$LOG_ERR"; fi; exit $rc' EXIT
+
+_log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >>"$LOG_OUT"; }
+_err() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] ERROR: $*" >>"$LOG_ERR"; }
+
+_log "Starting custom build for $pkg"
+
+# Example sequence (adapt as necessary):
+# - run configure like mach or python client
+# - build with mozbuild/mach
+# - run tests selectively only if requested
+
+cd "${BUILD_DIR}/${pkg}" || { _err "Build dir missing"; exit 2; }
+
+# ensure Python env if required
+if command -v python3 >/dev/null 2>&1; then
+  _log "Using python3: $(python3 --version 2>&1)"
+else
+  _err "python3 not found"
+  exit 3
+fi
+
+# Prepare with mach (example)
+if [ -x "./mach" ]; then
+  ./mach clobber >>"$LOG_OUT" 2>>"$LOG_ERR" || _log "mach clobber non-fatal"
+  ./mach bootstrap --no-interactive >>"$LOG_OUT" 2>>"$LOG_ERR" || { _err "mach bootstrap failed"; exit 4; }
+  ./mach configure >>"$LOG_OUT" 2>>"$LOG_ERR" || { _err "mach configure failed"; exit 5; }
+  ./mach build >>"$LOG_OUT" 2>>"$LOG_ERR" || { _err "mach build failed"; exit 6; }
+else
+  _err "mach driver not present; cannot run custom firefox steps"
+  exit 7
+fi
+
+_log "Custom build finished successfully"
+exit 0
