@@ -1,0 +1,221 @@
+----------------------------------------------------------------
+12. 10-update
+------------------------------------------------------------------
+Função: atualizar pacotes de forma estável e previsível.
+
+Fluxo detalhado:
+
+1. Recebe nome do pacote (ex: "pkg update firefox").
+2. Localiza o arquivo .desc correspondente:
+       package/www/firefox/firefox.desc
+3. Lê os campos:
+       NAME, VERSION, URL, SHA256
+4. Acessa a URL base do tarball ou repositório oficial.
+   Exemplo: https://ftp.mozilla.org/pub/firefox/releases/
+
+5. Busca as versões disponíveis.
+6. Compara com a versão atual:
+       - Se existir uma versão MAIOR (ex: 118 → 119), propõe atualização.
+       - Ignora versões menores, betas, nightlies, etc.
+         Isso garante estabilidade (só avança versão principal).
+
+7. Baixa o novo tarball temporariamente.
+8. Calcula SHA256 da nova versão.
+9. Atualiza automaticamente o .desc:
+       - Substitui VERSION, URL e SHA256
+       - Mantém BUILD_DEPS, RUN_DEPS e outros campos
+10. Salva backup do .desc antigo em:
+       package/www/firefox/firefox.desc.bak
+11. Executa uma reconstrução automática:
+       pkg rebuild firefox
+12. Gera logs detalhados:
+       /var/log/pkg/update/firefox.log
+
+
+4. POLÍTICA DE ESTABILIDADE
+----------------------------
+A regra de atualização é simples:
+
+- Só atualiza quando:
+     nova_versão > versão_atual  (mudança de major)
+- Não atualiza se:
+     nova_versão é beta, rc, nightly, ou patch menor.
+
+Isso garante que o sistema se mantenha estável, previsível e coerente.
+
+
+5. INTEGRAÇÃO COM OS OUTROS SCRIPTS
+------------------------------------
+update-pkg depende dos seguintes scripts:
+
+   - fetch (para baixar a nova fonte)
+   - extract (para preparar o build)
+   - build/install/package (para reconstruir)
+   - uninstall (para remover versão antiga antes de instalar nova)
+
+Fluxo automático:
+   update → uninstall(old) → build(new) → install(new)
+
+
+6. LOGS E CONTROLE
+-------------------
+Cada operação (update/uninstall) cria logs completos:
+   /var/log/pkg/update/$PKG.log
+   /var/log/pkg/uninstall/$PKG.log
+
+E registra o estado no banco de pacotes:
+   /var/lib/pkgdb/$PKG/status
+   Campos: version, build_date, installed_files
+
+
+7. BENEFÍCIOS DO MÉTODO
+------------------------
+✔ Atualizações seguras e estáveis  
+✔ Sem necessidade de rastrear repositórios git  
+✔ Compatível com o formato .desc existente  
+✔ Totalmente automatizável  
+✔ Mantém histórico e rollback simples  
+✔ Ideal para sistemas de compilação estáveis (como T2, LFS, BLFS)
+
+DEPENDÊNCIAS EM ATUALIZAÇÃO DE PACOTES
+======================================
+
+1. PROBLEMA PRINCIPAL
+---------------------
+Quando você atualiza um pacote, as dependências dele podem:
+
+- Não ter mudado → tudo ok
+- Ter uma versão mínima maior → pode ser necessário atualizar também
+- Ter mudado de forma incompatível → pode quebrar outros pacotes que dependem da versão antiga
+
+Exemplo: Firefox 118 → 119
+- Firefox 119 pode exigir Rust >= 1.77
+- Se a versão antiga do Rust era 1.76, você precisa atualizar Rust primeiro
+
+Portanto, **não basta atualizar só o pacote** — precisa checar todas as dependências.
+
+
+2. FLUXO DE DEPENDÊNCIAS DURANTE UPDATE
+----------------------------------------
+Ao executar `pkg update <pacote>`:
+
+1. Lê o .desc atual do pacote
+2. Busca a nova versão estável no mainstream
+3. Baixa ou valida tarball + SHA256
+4. Antes de build:
+   - O script **depsolve** é chamado novamente, **agora usando a versão nova**
+   - Verifica:
+       a) Todas as BUILD_DEPS atendidas
+       b) RUN_DEPS compatíveis
+5. Para qualquer dependência que precise ser atualizada, o sistema:
+   - Adiciona na fila de atualização
+   - Executa update dessas dependências **antes do pacote principal**
+6. Após dependências corretas, atualiza o pacote principal
+7. Opcional: mantém registro das versões antigas (rollback)
+
+
+3. COMO LIDAR COM DEPENDÊNCIAS DE VERSÃO ANTERIOR
+---------------------------------------------------
+- Cada pacote mantém no banco local:
+      installed.db:
+        - NAME
+        - VERSION
+        - BUILD_DEPS
+        - RUN_DEPS
+
+- Quando o update detecta que a nova versão exige dependências maiores:
+      - Verifica banco local
+      - Se a dependência atual < exigida:
+          → agenda atualização da dependência primeiro
+      - Se a dependência atual >= exigida:
+          → não faz nada, mantém
+
+- Isso garante que **dependências da versão anterior** não bloqueiem o update,
+  mas também não quebra pacotes que dependem dela.
+
+
+4. ESTRATÉGIA DE ESTABILIDADE
+------------------------------
+- Só atualiza dependências se necessário (min_version > versão atual)
+- Mantém pacotes não afetados intactos
+- Pode criar "locks" para versões críticas (ex: GTK ou glib)
+- Permite reconstrução em ordem topológica correta: dependência → pacote dependente
+
+
+5. FLUXO COMPLETO DE UPDATE COM DEPENDÊNCIAS
+--------------------------------------------
+pkg update firefox
+ ├─> lê firefox.desc
+ ├─> busca nova versão estável
+ ├─> atualiza .desc temporário
+ ├─> depsolve(build_deps + run_deps da nova versão)
+ │     ├─> detecta que Rust precisa ser >=1.77
+ │     ├─> agenda update rustc antes
+ │     └─> agenda update gtk3, dbus se necessário
+ ├─> executa updates das dependências em ordem correta
+ ├─> build nova versão do firefox
+ ├─> install nova versão
+ ├─> hooks pós-build/pós-install
+ └─> log completo + backup .desc antigo
+
+
+6. RESUMO
+----------
+✔ Dependências da versão antiga não bloqueiam update  
+✔ O sistema resolve **automaticamente** dependências mínimas da versão nova  
+✔ Ordem topológica garante que nada quebre  
+✔ Logs e backup permitem rollback se algo falhar  
+✔ Funciona para pacotes complexos como Firefox, KDE ou GNOME  
+
+Conclusão:
+- Sim, funciona com dependências da versão anterior, desde que o update **verifique os requisitos mínimos da nova versão** antes de compilar.
+- Esse é o comportamento adotado por gerenciadores de pacotes robustos (ex: Portage, pkgsrc, Gentoo, FreeBSD ports).
+
+-------------------------------------------------------
+. EXEMPLO DE ATUALIZAÇÃO
+--------------------------
+Antes:
+   VERSION = 118.0
+   URL = https://ftp.mozilla.org/pub/firefox/releases/118.0/source/firefox-118.0.tar.xz
+   SHA256 = abcd123...
+
+Após "pkg update firefox":
+   VERSION = 119.0
+   URL = https://ftp.mozilla.org/pub/firefox/releases/119.0/source/firefox-119.0.tar.xz
+   SHA256 = efg987...
+
+
+9. HOOKS OPCIONAIS
+-------------------
+Para integração total, o sistema pode suportar hooks adicionais:
+
+   /hooks/pre-update/$PKG
+   /hooks/post-update/$PKG
+   /hooks/post-uninstall/$PKG
+
+Exemplo:
+   pre-update/firefox → limpa cache antigo de builds
+   post-update/firefox → atualiza MIME, desktop-db, etc.
+
+
+10. RESUMO FINAL
+----------------
+Os novos scripts expandem o sistema para gerenciar ciclo completo:
+
+   BUILD → INSTALL → UPDATE → UNINSTALL
+
+Com estabilidade garantida via comparação de versão MAIOR e
+automação total do .desc.
+
+Fluxo visual:
+
+pkg update firefox
+ ├─> lê firefox.desc
+ ├─> busca nova versão (estável)
+ ├─> baixa tarball
+ ├─> atualiza .desc
+ ├─> uninstall versão antiga
+ ├─> build nova versão
+ ├─> install nova versão
+ ├─> executa hooks
+ └─> log completo + backup .desc
