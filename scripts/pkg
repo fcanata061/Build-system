@@ -1,0 +1,1017 @@
+#!/usr/bin/env bash
+# /usr/bin/pkg
+# Unified package CLI that orchestrates scripts 00..11 in /usr/bin/
+# - Subcommands: bootstrap, fetch, extract, depsolve, build, install, package, clean, uninstall, update, controller, publish, rollback, status, doctor, logs, completion, help
+# - Full install pipeline: resolve deps, build deps, build package, install to / with rollback
+# - Uses logs in /var/log/pkg/
+# - Expects scripts 00..11 in /usr/bin/
+#
+set -euo pipefail
+if [ -n "${BASH_VERSION-}" ]; then set -o pipefail; fi
+
+###############################################################################
+# Configuration and environment
+###############################################################################
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="/usr/bin"             # location of helper scripts 00..11 as agreed
+ROOT="/usr/src/repo"
+DESC_ROOT="${ROOT}/package"
+PKGDB_DIR="/var/lib/pkgdb"
+LOG_BASE="/var/log/pkg"
+CONTROLLER_LOG_DIR="${LOG_BASE}/controller"
+DOWNLOAD_TMP="/tmp/pkg_run.$$"
+LOCK_DIR="/var/run/pkg-locks"
+GLOBAL_LOCKFILE="/var/run/pkg_global.lock"
+DEFAULT_REMOTE_MODE="rsync"
+DEFAULT_REMOTE_TARGET=""
+
+SILENT_PATTERNS="permission denied|segmentation fault|undefined reference|core dumped|internal compiler error|I/O error|read-only file system"
+
+# default behavior flags (can be overridden by env or CLI)
+DRY_RUN=no
+AUTO_YES=no
+VERBOSE=no
+REMOTE_MODE="${DEFAULT_REMOTE_MODE}"
+REMOTE_TARGET="${DEFAULT_REMOTE_TARGET}"
+MAX_RETRY=2
+ALLOW_RETRY=yes
+STAGE_TIMEOUT=3600
+MAX_DEP_UPDATE_DEPTH=12
+
+# ensure dirs
+mkdir -p "${LOG_BASE}" "${PKGDB_DIR}" "${LOCK_DIR}" "${DOWNLOAD_TMP}" "${CONTROLLER_LOG_DIR}" || true
+
+# locate helper scripts (full paths)
+BOOTSTRAP_SCRIPT="${SCRIPT_DIR}/00-bootstrap.sh"
+FETCH_SCRIPT="${SCRIPT_DIR}/01-fetch.sh"
+EXTRACT_SCRIPT="${SCRIPT_DIR}/02-extract.sh"
+DEPSOLVE_SCRIPT="${SCRIPT_DIR}/03-depsolve.sh"
+BUILD_SCRIPT="${SCRIPT_DIR}/04-build.sh"
+INSTALL_SCRIPT="${SCRIPT_DIR}/05-install.sh"
+PACKAGE_SCRIPT="${SCRIPT_DIR}/06-package.sh"
+CLEAN_SCRIPT="${SCRIPT_DIR}/08-clean.sh"
+UNINSTALL_SCRIPT="${SCRIPT_DIR}/09-uninstall.sh"
+UPDATE_SCRIPT="${SCRIPT_DIR}/10-update.sh"
+CONTROLLER_SCRIPT="${SCRIPT_DIR}/11-controller.sh"
+
+# colors
+RED="\033[0;31m"; GREEN="\033[0;32m"; YELLOW="\033[0;33m"; BLUE="\033[0;34m"; MAGENTA="\033[0;35m"; NC="\033[0m"
+
+# helper loggers
+log_info(){ printf "%b[INFO] %s%b\n" "$BLUE" "$(date -u +"%Y-%m-%dT%H:%M:%SZ") - $*" "$NC"; }
+log_warn(){ printf "%b[WARN] %s%b\n" "$YELLOW" "$(date -u +"%Y-%m-%dT%H:%M:%SZ") - $*" "$NC"; }
+log_error(){ printf "%b[ERROR] %s%b\n" "$RED" "$(date -u +"%Y-%m-%dT%H:%M:%SZ") - $*" "$NC"; }
+log_debug(){ if [ "$VERBOSE" = "yes" ]; then printf "%b[DEBUG] %s%b\n" "$MAGENTA" "$(date -u +"%Y-%m-%dT%H:%M:%SZ") - $*" "$NC"; fi; }
+
+# trap cleanup
+_cleanup() {
+  rm -rf "${DOWNLOAD_TMP}" 2>/dev/null || true
+}
+trap _cleanup EXIT
+
+# helper: require root
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    log_error "This command must be run as root (use sudo). Aborting."
+    exit 10
+  fi
+}
+
+# helper: safe run wrapper with dry-run support
+safe_run() {
+  local cmd="$*"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] $cmd"
+    return 0
+  fi
+  log_debug "Executing: $cmd"
+  eval "$cmd"
+  return $?
+}
+
+# helper: retry wrapper (exponential backoff)
+retry_cmd() {
+  local tries="${1:-3}"; shift
+  local cmd="$*"
+  local attempt=0
+  local wait=1
+  while true; do
+    attempt=$((attempt+1))
+    if eval "$cmd"; then
+      return 0
+    fi
+    rc=$?
+    if [ "$attempt" -ge "$tries" ]; then
+      return $rc
+    fi
+    sleep $wait
+    wait=$((wait*2))
+    log_warn "Retrying command (attempt ${attempt}/${tries})..."
+  done
+}
+
+# helper: compute sha256
+compute_sha256() {
+  local file="$1"
+  sha256sum "$file" 2>/dev/null | awk '{print $1}'
+}
+
+# helper: find desc file for package name
+find_desc_for_pkg() {
+  local pkg="$1"
+  local path
+  path="$(find "${DESC_ROOT}" -maxdepth 4 -type f -name "${pkg}.desc" 2>/dev/null | head -n1 || true)"
+  if [ -z "$path" ] && [ -f "${DESC_ROOT}/${pkg}.desc" ]; then
+    path="${DESC_ROOT}/${pkg}.desc"
+  fi
+  echo "$path"
+}
+
+# helper: parse key from desc (safe, no source)
+desc_get() {
+  local desc="$1" key="$2"
+  awk -F= -v k="$key" '$1==k{ $1=""; sub(/^=/,""); sub(/^ */,""); print substr($0,2); exit }' "$desc" 2>/dev/null || true
+}
+
+# helper: detect silent errors in a log
+detect_silent_errors_in() {
+  local logfile="$1"
+  if [ -f "$logfile" ] && grep -Ei "${SILENT_PATTERNS}" "$logfile" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+# helper: write pkgdb metadata
+pkgdb_write_metadata() {
+  local pkg="$1"; shift
+  local meta_dir="${PKGDB_DIR}/${pkg}"
+  mkdir -p "${meta_dir}"
+  for kv in "$@"; do
+    echo "$kv" >> "${meta_dir}/metadata"
+  done
+}
+
+###############################################################################
+# CLI: help text (comprehensive)
+###############################################################################
+show_help() {
+cat <<'EOF'
+pkg - unified package manager wrapper (scripts 00..11)
+
+Usage:
+  pkg [global options] <command> [command options]
+
+Global options:
+  -n, --dry-run            Simulate actions (no destructive changes)
+  -y, --yes                Auto-confirm prompts
+  -v, --verbose            Verbose/debug output
+  --remote-mode MODE       rsync|git (override remote mode)
+  --remote-target TARGET   remote target for publish (user@host:/path or git URL)
+  --max-retry N            Max retry attempts (default 2)
+  --help                   Show this help
+
+Commands (each has its own --help):
+  bootstrap                Build toolchain and prepare environment (00-bootstrap.sh)
+  fetch <pkg|all>          Download sources (01-fetch.sh)
+  extract <pkg|all>        Extract sources (02-extract.sh)
+  depsolve <pkg|all>       Resolve dependencies (03-depsolve.sh)
+  build <pkg|queue|all>    Build packages (04-build.sh)
+  install <pkg>            Full pipeline: depsolve→build→install to / (requires root)
+  package <pkg|all>        Package built result (06-package.sh)
+  clean [options]          Clean temp/build artifacts (08-clean.sh)
+  uninstall <pkg>          Uninstall package (09-uninstall.sh)
+  update <pkg>             Update package (10-update.sh)
+  controller               Run controller (11-controller.sh)
+  publish <pkg>            Publish package via rsync|git
+  rollback <pkg>           Rollback package (restore .desc + pkgdb)
+  status [pkg]             Show package/db status
+  doctor                   Run system checks
+  logs <pkg> [--stage X]   Show log path or tail logs
+  completion [bash|zsh]    Print shell completion
+  help                     Show this help
+
+Examples:
+  sudo pkg install firefox
+  pkg update firefox --yes --remote-target "user@repo:/srv/mirror"
+  pkg build --queue /var/lib/pkgdb/depsolve.map --jobs 8
+
+EOF
+}
+
+###############################################################################
+# Global option parsing (first pass)
+###############################################################################
+if [ $# -lt 1 ]; then show_help; exit 1; fi
+
+# parse leading global options manually
+GLOBAL_ARGS=()
+while :; do
+  case "${1:-}" in
+    -n|--dry-run) DRY_RUN=yes; shift ;;
+    -y|--yes) AUTO_YES=yes; shift ;;
+    -v|--verbose) VERBOSE=yes; shift ;;
+    --remote-mode) shift; REMOTE_MODE="${1:-}"; shift ;;
+    --remote-target) shift; REMOTE_TARGET="${1:-}"; shift ;;
+    --max-retry) shift; MAX_RETRY="${1:-}"; shift ;;
+    --help) show_help; exit 0 ;;
+    --) shift; break ;;
+    -*)
+      echo "Unknown global option: $1"; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+# command
+CMD="${1:-}"; shift || true
+
+###############################################################################
+# Common helpers used by commands
+###############################################################################
+# Acquire per-package lock (prevent concurrent operations on same package)
+pkg_lock_acquire() {
+  local pkg="$1"
+  local lockf="${LOCK_DIR}/${pkg}.lock"
+  exec {LOCKFD}>"${lockf}" || { log_error "Cannot create lock ${lockf}"; return 1; }
+  if ! flock -n "${LOCKFD}"; then
+    log_error "Package ${pkg} is locked by another process"
+    return 2
+  fi
+  # LOCKFD stays open until function that called this returns (caller should close)
+  return 0
+}
+pkg_lock_release() {
+  if [ -n "${LOCKFD-}" ]; then
+    flock -u "${LOCKFD}" 2>/dev/null || true
+    eval "exec ${LOCKFD}>&-" || true
+  fi
+}
+
+# wrapper to call helper scripts present in /usr/bin
+call_helper() {
+  local script="$1"; shift
+  if [ ! -x "$script" ]; then
+    log_error "Helper script not found or not executable: $script"
+    return 127
+  fi
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash \"$script\" $*"
+    return 0
+  fi
+  bash "$script" "$@"
+  return $?
+}
+
+###############################################################################
+# Implementations of commands: bootstrap, fetch, extract, depsolve
+###############################################################################
+
+cmd_bootstrap() {
+  local force=no; local jobs=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=yes; shift ;;
+      --jobs) shift; jobs="$1"; shift ;;
+      --help) cat <<EOF
+pkg bootstrap [--force] [--jobs N]
+  Build minimal toolchain (binutils, gcc, glibc) and configure build environment.
+  --force    Rebuild even if toolchain exists
+  --jobs N   Parallel jobs passed to bootstrap script (if supported)
+EOF
+      return 0 ;;
+      *) echo "Unknown bootstrap option: $1"; return 1 ;;
+    esac
+  done
+
+  log_info "Running bootstrap (force=${force}, jobs=${jobs})"
+  if [ ! -x "$BOOTSTRAP_SCRIPT" ]; then
+    log_error "Bootstrap helper not found at ${BOOTSTRAP_SCRIPT}"
+    return 1
+  fi
+  local logfile="${LOG_BASE}/bootstrap.log"
+  mkdir -p "$(dirname "$logfile")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${BOOTSTRAP_SCRIPT} ${force}"
+    return 0
+  fi
+  if ! bash "${BOOTSTRAP_SCRIPT}" "${force}" "${jobs}" >>"${logfile}" 2>&1; then
+    log_error "Bootstrap failed. Check ${logfile}"
+    return 1
+  fi
+  log_info "Bootstrap finished successfully"
+  return 0
+}
+
+cmd_fetch() {
+  local target="$1"; shift || true
+  local parallel=4; local retry=3
+  # args parsing
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --parallel) shift; parallel="$1"; shift ;;
+      --retry) shift; retry="$1"; shift ;;
+      --help) cat <<EOF
+pkg fetch <pkg|all> [--parallel N] [--retry N]
+  Download sources for a package or all packages. Uses 01-fetch.sh located in /usr/bin/.
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then
+    echo "Usage: pkg fetch <pkg|all> [--parallel N]"; return 1
+  fi
+
+  if [ "$target" = "all" ]; then
+    # call fetch script in batch mode (assumed support)
+    log_info "Fetching all packages (parallel=${parallel})"
+    local l="${LOG_BASE}/fetch/all.log"
+    mkdir -p "$(dirname "$l")"
+    if [ "$DRY_RUN" = "yes" ]; then
+      log_info "[DRY-RUN] bash ${FETCH_SCRIPT} all --parallel ${parallel} --retry ${retry}"
+      return 0
+    fi
+    if ! bash "${FETCH_SCRIPT}" all --parallel "${parallel}" --retry "${retry}" >>"$l" 2>&1; then
+      log_error "Fetch all failed (see $l)"; return 1
+    fi
+    log_info "Fetch all completed"
+    return 0
+  fi
+
+  # single package fetch
+  local pkg="$target"
+  local desc
+  desc="$(find_desc_for_pkg "$pkg")"
+  if [ -z "$desc" ]; then
+    log_error "No .desc found for package ${pkg}"
+    return 1
+  fi
+  local l="${LOG_BASE}/fetch/${pkg}.log"
+  mkdir -p "$(dirname "$l")"
+  log_info "Fetching ${pkg} (parallel=${parallel},retry=${retry}) -> log: ${l}"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${FETCH_SCRIPT} ${pkg} --parallel ${parallel} --retry ${retry}"
+    return 0
+  fi
+  if ! bash "${FETCH_SCRIPT}" "${pkg}" --parallel "${parallel}" --retry "${retry}" >>"${l}" 2>&1; then
+    log_error "Fetch failed for ${pkg}. Check ${l}"
+    return 1
+  fi
+  log_info "Fetch finished for ${pkg}"
+  return 0
+}
+
+cmd_extract() {
+  local target="$1"; shift || true
+  local clean_old=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --clean-old) clean_old=yes; shift ;;
+      --help) cat <<EOF
+pkg extract <pkg|all> [--clean-old]
+  Extract downloaded sources into build tree (02-extract.sh).
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+  if [ -z "$target" ]; then echo "Usage: pkg extract <pkg|all>"; return 1; fi
+  if [ "$target" = "all" ]; then
+    log_info "Extracting all packages"
+    local l="${LOG_BASE}/extract/all.log"
+    mkdir -p "$(dirname "$l")"
+    if [ "$DRY_RUN" = "yes" ]; then
+      log_info "[DRY-RUN] bash ${EXTRACT_SCRIPT} all --clean-old ${clean_old}"
+      return 0
+    fi
+    if ! bash "${EXTRACT_SCRIPT}" all --clean-old "${clean_old}" >>"$l" 2>&1; then
+      log_error "Extract all failed (see $l)"; return 1
+    fi
+    log_info "Extract all completed"
+    return 0
+  fi
+  local pkg="$target"; local l="${LOG_BASE}/extract/${pkg}.log"; mkdir -p "$(dirname "$l")"
+  log_info "Extracting ${pkg} -> ${l}"
+  if [ "$DRY_RUN" = "yes" ]; then log_info "[DRY-RUN] bash ${EXTRACT_SCRIPT} ${pkg} --clean-old ${clean_old}"; return 0; fi
+  if ! bash "${EXTRACT_SCRIPT}" "${pkg}" --clean-old "${clean_old}" >>"$l" 2>&1; then
+    log_error "Extract failed for ${pkg}. Check ${l}"; return 1
+  fi
+  log_info "Extract finished for ${pkg}"
+  return 0
+}
+
+cmd_depsolve() {
+  local target="${1:-}"
+  local show_only=no; local graph=""
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --show-only) show_only=yes; shift ;;
+      --graph) shift; graph="$1"; shift ;;
+      --help) cat <<EOF
+pkg depsolve <pkg|all> [--show-only] [--graph <dotfile>]
+  Resolve dependencies. Writes /var/lib/pkgdb/depsolve.map and depsolve.blocked (03-depsolve.sh).
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ -z "${target}" ]; then echo "Usage: pkg depsolve <pkg|all>"; return 1; fi
+  log_info "Running depsolve for ${target}"
+  local l="${LOG_BASE}/depsolve/${target}.log"; mkdir -p "$(dirname "$l")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${DEPSOLVE_SCRIPT} ${target} --graph ${graph}"
+    return 0
+  fi
+  if ! bash "${DEPSOLVE_SCRIPT}" "${target}" >>"$l" 2>&1; then
+    log_warn "Depsolve returned non-zero; check ${l}"
+    # still allow to inspect map if produced
+  fi
+  if [ -f "${PKGDB_DIR}/depsolve.map" ]; then
+    log_info "Depsolve map available: ${PKGDB_DIR}/depsolve.map"
+    if [ "$show_only" = "yes" ]; then
+      cat "${PKGDB_DIR}/depsolve.map"
+    fi
+  else
+    log_error "Depsolve did not write ${PKGDB_DIR}/depsolve.map. See ${l}"
+    return 2
+  fi
+  return 0
+}
+
+###############################################################################
+# End of Part 1
+###############################################################################
+# The script continues in Part 2 with build, install (full pipeline), package,
+# clean, uninstall, update, controller, publish, rollback, status, doctor, logs,
+# completion and the main dispatcher.
+#!/usr/bin/env bash
+# Continuation of /usr/bin/pkg (Part 2)
+# NOTE: If you pasted Part 1 into /usr/bin/pkg, append Part 2 below it.
+
+# continue using same vars and functions defined earlier
+
+# helper: read depsolve map into queue array
+read_depsolve_map() {
+  local mapfile="${PKGDB_DIR}/depsolve.map"
+  if [ ! -f "$mapfile" ]; then
+    log_error "Depsolve map not found: $mapfile"
+    return 1
+  fi
+  mapfile -t QUEUE < "$mapfile"
+  return 0
+}
+
+# build command: builds single pkg or queue/all
+cmd_build() {
+  # usage: pkg build <pkg|queue|all> [--jobs N] [--resume]
+  local target="$1"; shift || true
+  local jobs=1; local resume=no; local keep_build=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --jobs) shift; jobs="$1"; shift ;;
+      --resume) resume=yes; shift ;;
+      --keep-build) keep_build=yes; shift ;;
+      --help) cat <<EOF
+pkg build <pkg|queue|all> [--jobs N] [--resume] [--keep-build]
+  Build a package or a queue of packages. Queue uses /var/lib/pkgdb/depsolve.map.
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then echo "Usage: pkg build <pkg|queue|all>"; return 1; fi
+
+  if [ "$target" = "queue" ] || [ "$target" = "all" ]; then
+    if ! read_depsolve_map; then return 1; fi
+    local total=${#QUEUE[@]}
+    log_info "Building queue: ${total} packages (jobs=${jobs})"
+    local i=0
+    for pkg in "${QUEUE[@]}"; do
+      i=$((i+1))
+      log_info "Building (${i}/${total}): ${pkg}"
+      local pkglog="${LOG_BASE}/build/${pkg}.log"; mkdir -p "$(dirname "$pkglog")"
+      if [ "$DRY_RUN" = "yes" ]; then
+        log_info "[DRY-RUN] bash ${BUILD_SCRIPT} ${pkg}"
+        continue
+      fi
+      if ! bash "${BUILD_SCRIPT}" "${pkg}" >>"${pkglog}" 2>&1; then
+        log_error "Build failed for ${pkg}. Check ${pkglog}"
+        # mark as blocked or continue depending on policy
+        return 1
+      fi
+      # detect silent errors
+      if detect_silent_errors_in "${pkglog}"; then
+        log_warn "Silent errors detected in build log for ${pkg} (see ${pkglog})"
+      fi
+      log_info "Build finished: ${pkg}"
+    done
+    return 0
+  else
+    local pkg="$target"
+    local pkglog="${LOG_BASE}/build/${pkg}.log"; mkdir -p "$(dirname "$pkglog")"
+    log_info "Building package: ${pkg} -> log: ${pkglog}"
+    if [ "$DRY_RUN" = "yes" ]; then log_info "[DRY-RUN] bash ${BUILD_SCRIPT} ${pkg}"; return 0; fi
+    if ! bash "${BUILD_SCRIPT}" "${pkg}" >>"${pkglog}" 2>&1; then
+      log_error "Build failed for ${pkg}"
+      return 1
+    fi
+    if detect_silent_errors_in "${pkglog}"; then log_warn "Silent errors in ${pkg} build"; fi
+    log_info "Build succeeded: ${pkg}"
+    return 0
+  fi
+}
+
+# install command: full pipeline - resolve deps, build deps, build pkg, install to /
+# This is the critical function you asked for: resolves deps, builds dependencies first,
+# installs into root (/) using install script which should accept package name and install to /
+cmd_install() {
+  # usage: pkg install <pkg> [--publish] [--no-publish]
+  local pkg="$1"; shift || true
+  local do_publish=yes
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-publish) do_publish=no; shift ;;
+      --publish) do_publish=yes; shift ;;
+      --help) cat <<EOF
+pkg install <pkg> [--publish|--no-publish]
+  Full pipeline: depsolve -> build dependencies -> build package -> install to /
+  Installs into the running system root (/). Requires root privileges.
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ -z "$pkg" ]; then echo "Usage: pkg install <pkg>"; return 1; fi
+  require_root
+
+  # find desc
+  local desc
+  desc="$(find_desc_for_pkg "$pkg")"
+  if [ -z "$desc" ]; then log_error "No .desc found for ${pkg}"; return 1; fi
+
+  # run depsolve to compute map for target package
+  log_info "Running depsolve for ${pkg} to compute dependency build order"
+  local depsolve_log="${LOG_BASE}/depsolve/${pkg}.log"; mkdir -p "$(dirname "$depsolve_log")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${DEPSOLVE_SCRIPT} ${pkg}"
+  else
+    if ! bash "${DEPSOLVE_SCRIPT}" "${pkg}" >>"${depsolve_log}" 2>&1; then
+      log_warn "Depsolve returned non-zero; check ${depsolve_log}"
+    fi
+  fi
+
+  local mapfile="${PKGDB_DIR}/depsolve.map"
+  if [ ! -f "${mapfile}" ]; then
+    log_error "Depsolve did not produce ${mapfile}; cannot proceed"
+    return 2
+  fi
+
+  # read queue and build dependencies first (stop before main package)
+  mapfile -t ORDER < "${mapfile}"
+  # find position of pkg in ORDER; update only dependencies before pkg
+  local dep_list=()
+  local found_main=0
+  for p in "${ORDER[@]}"; do
+    if [ "$p" = "$pkg" ]; then found_main=1; break; fi
+    dep_list+=("$p")
+  done
+
+  # backup desc and pkgdb for main package
+  local desc_bak="${desc}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -a -- "${desc}" "${desc_bak}"
+  log_info "Backed up .desc -> ${desc_bak}"
+  if [ -d "${PKGDB_DIR}/${pkg}" ]; then
+    mkdir -p "${PKGDB_DIR}/.backups"
+    local pkgbak="${PKGDB_DIR}/.backups/${pkg}_$(date -u +%Y%m%dT%H%M%SZ).tar.xz"
+    tar -cJf "${pkgbak}" -C "${PKGDB_DIR}" "${pkg}" >>"${LOG_BASE}/install/${pkg}.log" 2>&1 || true
+    log_info "Pkgdb backup -> ${pkgbak}"
+  fi
+
+  # Build dependencies
+  if [ "${#dep_list[@]}" -gt 0 ]; then
+    log_info "Building dependencies for ${pkg}: ${dep_list[*]}"
+    for d in "${dep_list[@]}"; do
+      log_info "Building dependency ${d}"
+      local dlog="${LOG_BASE}/build/${d}.log"; mkdir -p "$(dirname "$dlog")"
+      if [ "$DRY_RUN" = "yes" ]; then
+        log_info "[DRY-RUN] bash ${BUILD_SCRIPT} ${d}"
+      else
+        if ! bash "${BUILD_SCRIPT}" "${d}" >>"${dlog}" 2>&1; then
+          log_error "Failed to build dependency ${d}. Aborting installation of ${pkg}"
+          # attempt to rollback main desc
+          cp -a -- "${desc_bak}" "${desc}"
+          return 3
+        fi
+        if detect_silent_errors_in "${dlog}"; then
+          log_warn "Silent errors detected in dependency ${d} build (see ${dlog})"
+        fi
+      fi
+    done
+  else
+    log_info "No dependencies to build for ${pkg}"
+  fi
+
+  # Build main package
+  log_info "Building main package ${pkg}"
+  local main_build_log="${LOG_BASE}/build/${pkg}.log"; mkdir -p "$(dirname "$main_build_log")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${BUILD_SCRIPT} ${pkg}"
+  else
+    if ! bash "${BUILD_SCRIPT}" "${pkg}" >>"${main_build_log}" 2>&1; then
+      log_error "Build failed for ${pkg}. Restoring .desc and aborting."
+      cp -a -- "${desc_bak}" "${desc}"
+      return 4
+    fi
+    if detect_silent_errors_in "${main_build_log}"; then
+      log_warn "Silent errors detected in ${pkg} build (see ${main_build_log})"
+    fi
+  fi
+
+  # Install to /
+  log_info "Installing ${pkg} to system root (/)"
+  local install_log="${LOG_BASE}/install/${pkg}.log"; mkdir -p "$(dirname "$install_log")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${INSTALL_SCRIPT} ${pkg}"
+  else
+    # ensure install script runs under fakeroot or as root (we required root earlier)
+    if ! bash "${INSTALL_SCRIPT}" "${pkg}" >>"${install_log}" 2>&1; then
+      log_error "Install failed for ${pkg}. Attempting rollback (uninstall). See ${install_log}"
+      # try uninstall of partial install
+      if [ -x "${UNINSTALL_SCRIPT}" ]; then
+        bash "${UNINSTALL_SCRIPT}" "${pkg}" >>"${install_log}" 2>&1 || true
+      fi
+      cp -a -- "${desc_bak}" "${desc}"
+      return 5
+    fi
+    if detect_silent_errors_in "${install_log}"; then
+      log_warn "Silent errors detected during install of ${pkg} (see ${install_log})"
+    fi
+  fi
+
+  # Package (optional)
+  log_info "Packaging ${pkg} (producing archive)"
+  local package_log="${LOG_BASE}/package/${pkg}.log"; mkdir -p "$(dirname "$package_log")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${PACKAGE_SCRIPT} ${pkg}"
+  else
+    bash "${PACKAGE_SCRIPT}" "${pkg}" >>"${package_log}" 2>&1 || log_warn "Package step failed (non-fatal) for ${pkg}"
+  fi
+
+  # Update pkgdb metadata
+  mkdir -p "${PKGDB_DIR}/${pkg}"
+  echo "NAME=${pkg}" > "${PKGDB_DIR}/${pkg}/metadata"
+  echo "VERSION=$(desc_get "${desc}" VERSION)" >> "${PKGDB_DIR}/${pkg}/metadata"
+  echo "INSTALLED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "${PKGDB_DIR}/${pkg}/metadata"
+
+  log_info "Install pipeline completed for ${pkg}"
+
+  # publish if desired
+  if [ "${do_publish}" = "yes" ] && [ -n "${REMOTE_TARGET}" ]; then
+    log_info "Publishing ${pkg} to ${REMOTE_TARGET} via ${REMOTE_MODE}"
+    # find package archive if any
+    local archive="$(ls -1t "${ROOT}/packages/${pkg}-"* 2>/dev/null | head -n1 || true)"
+    if [ -n "$archive" ]; then
+      if [ "${REMOTE_MODE}" = "rsync" ]; then
+        retry_cmd 3 rsync -av --partial --progress "${archive}" "${REMOTE_TARGET%/}/${pkg}/" >>"${LOG_BASE}/publish/${pkg}.log" 2>&1 || log_warn "Publish rsync failed"
+      else
+        # git publish
+        tmpdir="$(mktemp -d "${DOWNLOAD_TMP}/git.XXXX")"
+        if git clone --depth 1 "${REMOTE_TARGET}" "${tmpdir}" >>"${LOG_BASE}/publish/${pkg}.log" 2>&1; then
+          mkdir -p "${tmpdir}/${pkg}"; cp -a "${archive}" "${tmpdir}/${pkg}/"; cp -a "${desc}" "${tmpdir}/${pkg}/"
+          (cd "${tmpdir}" && git add -A && git commit -m "publish ${pkg} $(date -u +"%Y-%m-%dT%H:%M:%SZ")" ) >>"${LOG_BASE}/publish/${pkg}.log" 2>&1 || true
+          (cd "${tmpdir}" && git push origin HEAD:master) >>"${LOG_BASE}/publish/${pkg}.log" 2>&1 || log_warn "git push failed"
+        else
+          log_warn "git clone ${REMOTE_TARGET} failed"
+        fi
+        rm -rf "${tmpdir}"
+      fi
+    else
+      log_warn "No package archive found to publish for ${pkg}"
+    fi
+  fi
+
+  return 0
+}
+
+# package command (wraps 06-package.sh)
+cmd_package() {
+  local target="$1"; shift || true
+  if [ -z "$target" ]; then echo "Usage: pkg package <pkg|all>"; return 1; fi
+  local l="${LOG_BASE}/package/${target}.log"; mkdir -p "$(dirname "$l")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${PACKAGE_SCRIPT} ${target}"
+    return 0
+  fi
+  if ! bash "${PACKAGE_SCRIPT}" "${target}" >>"${l}" 2>&1; then
+    log_error "Package failed for ${target}. Check ${l}"; return 1
+  fi
+  log_info "Package completed for ${target}"
+  return 0
+}
+
+# clean command (wraps 08-clean.sh)
+cmd_clean() {
+  local stage="all"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --stage) shift; stage="$1"; shift ;;
+      --help) cat <<EOF
+pkg clean [--stage build|logs|tmp|all]
+  Clean temporary and build artifacts (calls 08-clean.sh)
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+  local l="${LOG_BASE}/clean/clean.log"; mkdir -p "$(dirname "$l")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${CLEAN_SCRIPT} ${stage}"
+    return 0
+  fi
+  if ! bash "${CLEAN_SCRIPT}" "${stage}" >>"${l}" 2>&1; then
+    log_warn "Clean script reported issues (see ${l})"
+    return 1
+  fi
+  log_info "Clean completed (stage=${stage})"
+  return 0
+}
+
+# uninstall command
+cmd_uninstall() {
+  local pkg="$1"; shift || true
+  local purge=no verify_only=no deps_clean=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=yes; shift ;;
+      --verify-only) verify_only=yes; shift ;;
+      --deps-clean) deps_clean=yes; shift ;;
+      --help) cat <<EOF
+pkg uninstall <pkg> [--purge] [--verify-only] [--deps-clean]
+  Uninstall package. --purge removes metadata; --verify-only lists files without removing.
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+  if [ -z "$pkg" ]; then echo "Usage: pkg uninstall <pkg>"; return 1; fi
+  require_root
+  local l="${LOG_BASE}/uninstall/${pkg}.log"; mkdir -p "$(dirname "$l")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${UNINSTALL_SCRIPT} ${pkg} --purge ${purge} --verify-only ${verify_only}"
+    return 0
+  fi
+  if ! bash "${UNINSTALL_SCRIPT}" "${pkg}" --purge "${purge}" --verify-only "${verify_only}" >>"${l}" 2>&1; then
+    log_error "Uninstall failed for ${pkg}. Check ${l}"
+    return 1
+  fi
+  log_info "Uninstall succeeded for ${pkg}"
+  if [ "$deps_clean" = "yes" ]; then
+    log_info "Running orphan detection & cleanup after uninstall (not implemented here; call depsolve audit)"
+  fi
+  return 0
+}
+
+# update command (wraps 10-update.sh)
+cmd_update() {
+  local pkg="$1"; shift || true
+  local publish_flag=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --publish) publish_flag=yes; shift ;;
+      --check) check_only=yes; shift ;;
+      --help) cat <<EOF
+pkg update <pkg> [--publish|--check]
+  Update a package: detect new MAJOR version, update .desc, rebuild dependencies first, then package.
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+  if [ -z "$pkg" ]; then echo "Usage: pkg update <pkg>"; return 1; fi
+  local l="${LOG_BASE}/update/${pkg}.log"; mkdir -p "$(dirname "$l")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${UPDATE_SCRIPT} ${pkg}"; return 0
+  fi
+  if ! bash "${UPDATE_SCRIPT}" "${pkg}" >>"${l}" 2>&1; then
+    log_error "Update failed for ${pkg}. Check ${l}"
+    return 1
+  fi
+  log_info "Update finished for ${pkg}"
+  return 0
+}
+
+# controller command
+cmd_controller() {
+  local config_file=""
+  local resume=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --config) shift; config_file="$1"; shift ;;
+      --resume) resume=yes; shift ;;
+      --help) cat <<EOF
+pkg controller [--config FILE] [--resume]
+  Run system-wide controller orchestration (calls 11-controller.sh).
+EOF
+      return 0 ;;
+      *) break ;;
+    esac
+  done
+  local l="${CONTROLLER_LOG_DIR}/controller.log"; mkdir -p "$(dirname "$l")"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "[DRY-RUN] bash ${CONTROLLER_SCRIPT} --config ${config_file} --resume ${resume}"
+    return 0
+  fi
+  if ! bash "${CONTROLLER_SCRIPT}" ${resume:+--resume} ${config_file:+--config "${config_file}"} >>"${l}" 2>&1; then
+    log_error "Controller run failed (see ${l})"
+    return 1
+  fi
+  log_info "Controller completed successfully (see ${l})"
+  return 0
+}
+
+# publish command (simple wrapper)
+cmd_publish() {
+  local pkg="$1"; shift || true
+  if [ -z "$pkg" ]; then echo "Usage: pkg publish <pkg>"; return 1; fi
+  local archive="$(ls -1t "${ROOT}/packages/${pkg}-"* 2>/dev/null | head -n1 || true)"
+  if [ -z "$archive" ]; then log_error "No archive found for ${pkg}"; return 1; fi
+  if [ -z "${REMOTE_TARGET}" ]; then log_error "REMOTE_TARGET not configured (use --remote-target)"; return 1; fi
+  mkdir -p "${LOG_BASE}/publish"
+  local l="${LOG_BASE}/publish/${pkg}.log"
+  if [ "${REMOTE_MODE}" = "rsync" ]; then
+    retry_cmd 3 rsync -av --partial --progress "${archive}" "${REMOTE_TARGET%/}/${pkg}/" >>"${l}" 2>&1 || { log_error "rsync publish failed (see ${l})"; return 1; }
+    log_info "Published ${pkg} to ${REMOTE_TARGET} via rsync"
+  else
+    # git publish
+    local tmp="$(mktemp -d "${DOWNLOAD_TMP}/git.XXXX")"
+    if ! git clone --depth 1 "${REMOTE_TARGET}" "${tmp}" >>"${l}" 2>&1; then rm -rf "${tmp}"; log_error "git clone failed"; return 1; fi
+    mkdir -p "${tmp}/${pkg}"; cp -a "${archive}" "${tmp}/${pkg}/" || true
+    (cd "${tmp}" && git add -A && git commit -m "publish ${pkg} $(date -u +"%Y-%m-%dT%H:%M:%SZ")") >>"${l}" 2>&1 || true
+    (cd "${tmp}" && git push origin HEAD:master) >>"${l}" 2>&1 || { log_error "git push failed"; rm -rf "${tmp}"; return 1; }
+    rm -rf "${tmp}"
+    log_info "Published ${pkg} to git ${REMOTE_TARGET}"
+  fi
+  return 0
+}
+
+# rollback command
+cmd_rollback() {
+  local pkg="$1"; shift || true
+  if [ -z "$pkg" ]; then echo "Usage: pkg rollback <pkg>"; return 1; fi
+  require_root
+  local desc="$(find_desc_for_pkg "${pkg}")"
+  local latestbak
+  latestbak="$(ls -1t "${desc}.bak."* 2>/dev/null | head -n1 || true)"
+  if [ -z "$latestbak" ]; then log_error "No desc backup found for ${pkg}"; return 1; fi
+  log_info "Restoring ${desc} from ${latestbak}"
+  cp -a -- "${latestbak}" "${desc}"
+  # restore pkgdb backup if present
+  local pkgbak="$(ls -1t "${PKGDB_DIR}/.backups/${pkg}_*.tar.xz" 2>/dev/null | head -n1 || true)"
+  if [ -n "$pkgbak" ]; then
+    log_info "Restoring pkgdb from ${pkgbak}"
+    tar -xJf "${pkgbak}" -C "${PKGDB_DIR}" || log_warn "pkgdb restore failed"
+  fi
+  # call uninstall as safety
+  if [ -x "${UNINSTALL_SCRIPT}" ]; then
+    log_info "Attempting uninstall of ${pkg} to cleanup partial install"
+    bash "${UNINSTALL_SCRIPT}" "${pkg}" >>"${LOG_BASE}/rollback/${pkg}.log" 2>&1 || log_warn "uninstall during rollback failed"
+  fi
+  log_info "Rollback completed for ${pkg}"
+  return 0
+}
+
+# status command
+cmd_status() {
+  local pkg="${1:-}"
+  if [ -n "${pkg}" ]; then
+    local md="${PKGDB_DIR}/${pkg}/metadata"
+    if [ -f "${md}" ]; then
+      echo "Metadata for ${pkg}:"
+      cat "${md}"
+    else
+      echo "No metadata for ${pkg}"
+    fi
+    return 0
+  fi
+  echo "Installed packages (summary):"
+  if [ ! -d "${PKGDB_DIR}" ]; then echo "(no pkgdb)"; return 0; fi
+  for d in "${PKGDB_DIR}"/*; do
+    [ -d "$d" ] || continue
+    local name="$(basename "$d")"
+    local ver="$(awk -F= '/^VERSION=/{print $2; exit}' "$d/metadata" 2>/dev/null || echo unknown)"
+    echo "${name} -> ${ver}"
+  done
+  return 0
+}
+
+# doctor command: quick health checks
+cmd_doctor() {
+  echo "System checks:"
+  local ok=0
+  # check required helper scripts
+  for s in "${BOOTSTRAP_SCRIPT}" "${FETCH_SCRIPT}" "${EXTRACT_SCRIPT}" "${DEPSOLVE_SCRIPT}" "${BUILD_SCRIPT}" "${INSTALL_SCRIPT}" "${PACKAGE_SCRIPT}" "${CLEAN_SCRIPT}" "${UNINSTALL_SCRIPT}" "${UPDATE_SCRIPT}" "${CONTROLLER_SCRIPT}"; do
+    if [ ! -x "$s" ]; then
+      log_warn "Missing helper script: $s"
+      ok=1
+    fi
+  done
+  # disk space check
+  local avail=$(df -Pm / | awk 'NR==2{print $4}')
+  if [ "$avail" -lt 1024 ]; then
+    log_warn "Low disk space on / : ${avail}MB"
+    ok=1
+  else
+    log_info "Disk OK: ${avail}MB free"
+  fi
+  # check essential commands
+  for cmd in curl gcc make tar xz sha256sum rsync git; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      log_warn "Command not found: $cmd"
+      ok=1
+    fi
+  done
+  if [ "$ok" -eq 0 ]; then
+    log_info "Doctor: all checks passed"
+    return 0
+  else
+    log_warn "Doctor: some checks failed"
+    return 1
+  fi
+}
+
+# logs command: show log path or tail
+cmd_logs() {
+  local pkg="$1"; shift || true
+  local stage="${1:-all}"
+  if [ -z "$pkg" ]; then echo "Usage: pkg logs <pkg> [stage]"; return 1; fi
+  if [ "$stage" = "all" ]; then
+    for sf in build install package fetch extract depsolve publish uninstall rollback; do
+      local f="${LOG_BASE}/${sf}/${pkg}.log"
+      if [ -f "$f" ]; then
+        echo "$f"
+      fi
+    done
+    return 0
+  fi
+  local f="${LOG_BASE}/${stage}/${pkg}.log"
+  if [ ! -f "$f" ]; then echo "No log for ${pkg} stage ${stage}"; return 1; fi
+  # tail follow if requested via --follow
+  if [ "${DRY_RUN}" = "yes" ]; then
+    echo "[DRY-RUN] tail -f ${f}"
+    return 0
+  fi
+  tail -n 200 "${f}"
+  return 0
+}
+
+# completion (bash)
+cmd_completion() {
+  local shell="${1:-bash}"
+  case "$shell" in
+    bash)
+      cat <<'BASHCOMP'
+_pkg_completions() {
+  local cur prev words cword
+  _init_completion || return
+  COMPREPLY=( $( compgen -W "bootstrap fetch extract depsolve build install package clean uninstall update controller publish rollback status doctor logs completion help" -- "$cur" ) )
+}
+complete -F _pkg_completions pkg
+BASHCOMP
+      ;;
+    zsh) echo "# zsh completion not implemented"; return 0 ;;
+    *) echo "Unsupported shell for completion: $shell"; return 1 ;;
+  esac
+  return 0
+}
+
+###############################################################################
+# Main dispatcher: map CMD to functions
+###############################################################################
+case "$CMD" in
+  bootstrap) cmd_bootstrap "$@" ;;
+  fetch) cmd_fetch "$@" ;;
+  extract) cmd_extract "$@" ;;
+  depsolve) cmd_depsolve "$@" ;;
+  build) cmd_build "$@" ;;
+  install) cmd_install "$@" ;;
+  package) cmd_package "$@" ;;
+  clean) cmd_clean "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  update) cmd_update "$@" ;;
+  controller) cmd_controller "$@" ;;
+  publish) cmd_publish "$@" ;;
+  rollback) cmd_rollback "$@" ;;
+  status) cmd_status "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  logs) cmd_logs "$@" ;;
+  completion) cmd_completion "$@" ;;
+  help|-h|--help) show_help ;;
+  *) echo "Unknown command: $CMD"; show_help; exit 1 ;;
+esac
+
+exit 0
