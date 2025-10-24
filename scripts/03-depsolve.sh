@@ -334,3 +334,430 @@ choose_provider_for_dep() {
   echo ""
   return 1
 }
+# build dependency graph for given target set (or all)
+declare -A NEEDS_RESOLVED  # mark nodes to resolve
+
+# mark all initial targets (if none, all packages)
+init_targets() {
+  local targets=("$@")
+  if [ "${#targets[@]}" -eq 0 ]; then
+    for p in "${!DESC_PATH[@]}"; do
+      NEEDS_RESOLVED["$p"]=1
+    done
+  else
+    for t in "${targets[@]}"; do
+      # if t includes version express like name@ver, strip for now
+      NEEDS_RESOLVED["$t"]=1
+    done
+  fi
+}
+
+# expand dependencies transitively, building ADJ and reverse index
+expand_all_deps() {
+  _dbg "Starting transitive dependency expansion"
+  ADJ=()
+  REVERSE_ADJ=()
+  IN_DEGREE=()
+
+  local queue=()
+  for n in "${!NEEDS_RESOLVED[@]}"; do queue+=("$n"); done
+
+  local processed=()
+  local depth=0
+  while [ "${#queue[@]}" -gt 0 ]; do
+    local cur="${queue[0]}"
+    queue=("${queue[@]:1}")
+    # guard
+    depth=$((depth+1))
+    if [ "$depth" -gt "$DEPSOLVE_MAX_DEPTH" ]; then
+      log_error "Depsolve runaway depth > $DEPSOLVE_MAX_DEPTH"
+      return 1
+    fi
+    # if no desc skip
+    if [ -z "${DESC_PATH[$cur]:-}" ]; then
+      # try find by prefix or virtual? mark blocked
+      BLOCK_REASON["$cur"]="no .desc found for $cur"
+      _dbg "No desc for $cur"
+      continue
+    fi
+    # gather deps string
+    local bdeps="${NODE_BUILD_DEPS[$cur]:-}"
+    local rdeps="${NODE_RUN_DEPS[$cur]:-}"
+    # include optional deps if enabled
+    local opts="${NODE_OPTIONS[$cur]:-}"
+    local included_bdeps=""
+    for dep in $bdeps; do
+      # skip if optional notation like foo:option (we support this)
+      if echo "$dep" | grep -q ':' ; then
+        local name="$(echo "$dep" | cut -d: -f1)"
+        local opt="$(echo "$dep" | cut -d: -f2)"
+        if echo " $OPTIONS_ENABLED " | grep -q " $opt "; then
+          included_bdeps="$included_bdeps $name"
+        else
+          _dbg "Skipping optional build dep $name for $cur (opt $opt not enabled)"
+        fi
+      else
+        included_bdeps="$included_bdeps $dep"
+      fi
+    done
+    # combine build + run deps for graph (build must come before run dependents; we'll treat build_deps primarily)
+    local all_deps="$included_bdeps $rdeps"
+    # iterate deps (support alternatives a|b)
+    for dep in $all_deps; do
+      # normalize token
+      dep="$(normalize_dep_token "$dep")"
+      if [ -z "$dep" ]; then continue; fi
+      # choose provider
+      local provider
+      provider="$(choose_provider_for_dep "$dep")" || provider=""
+      if [ -z "$provider" ]; then
+        BLOCK_REASON["$cur"]="missing provider for dependency '$dep'"
+        log_warn "Missing provider for $cur -> $dep"
+        continue
+      fi
+      # add edge cur -> provider
+      ADJ["$cur"]="${ADJ[$cur]:-} $provider"
+      REVERSE_ADJ["$provider"]="${REVERSE_ADJ[$provider]:-} $cur"
+      # mark indegree
+      IN_DEGREE["$provider"]=$(( ${IN_DEGREE["$provider"]:-0} + 1 ))
+      # ensure provider present in sets
+      if [ -z "${DESC_PATH[$provider]:-}" ]; then
+        # not present as desc; try installed db as satisfied
+        _dbg "Provider $provider for $cur has no .desc; check installed db"
+      fi
+      # enqueue provider if not processed
+      if [ -z "${processed[$provider]:-}" ]; then
+        queue+=("$provider")
+      fi
+    done
+    processed["$cur"]=1
+  done
+
+  # ensure IN_DEGREE entries exist for all nodes
+  for n in "${!DESC_PATH[@]}"; do
+    IN_DEGREE["$n"]=${IN_DEGREE["$n"]:-0}
+  done
+  _dbg "Adjacency built"
+  return 0
+}
+
+# detect cycles using Kahn leftover approach
+detect_cycles() {
+  # perform Kahn partial run, nodes with indegree 0 are roots; remove and reduce
+  local -a q=()
+  local -A indeg_copy
+  local node
+  for node in "${!IN_DEGREE[@]}"; do indeg_copy["$node"]=${IN_DEGREE["$node"]}; done
+  for node in "${!indeg_copy[@]}"; do
+    if [ "${indeg_copy[$node]}" -eq 0 ]; then
+      q+=("$node")
+    fi
+  done
+  local processed_count=0
+  while [ "${#q[@]}" -gt 0 ]; do
+    local n="${q[0]}"; q=("${q[@]:1}")
+    processed_count=$((processed_count+1))
+    # for each neighbor (provider) reduce indeg
+    for nb in ${ADJ[$n]:-}; do
+      indeg_copy["$nb"]=$(( ${indeg_copy[$nb]:-0} - 1 ))
+      if [ "${indeg_copy[$nb]}" -eq 0 ]; then
+        q+=("$nb")
+      fi
+    done
+  done
+  local total_nodes=0
+  for _n in "${!indeg_copy[@]}"; do total_nodes=$((total_nodes+1)); done
+  if [ "$processed_count" -lt "$total_nodes" ]; then
+    # cycle exists: compute nodes with indeg>0 in indeg_copy as cycle participants
+    local cycle_nodes=()
+    for n in "${!indeg_copy[@]}"; do
+      if [ "${indeg_copy[$n]}" -gt 0 ]; then cycle_nodes+=("$n"); fi
+    done
+    # build cycle report text
+    local report="${DEPS_DIR}/cycle_report.txt"
+    {
+      echo "Dependency cycle detected at $(_now)"
+      echo "Cycle nodes:"
+      for cn in "${cycle_nodes[@]}"; do
+        echo " - $cn (desc: ${DESC_PATH[$cn]:-none})"
+      done
+      echo
+      echo "Adjacency:"
+      for cn in "${cycle_nodes[@]}"; do
+        echo "$cn -> ${ADJ[$cn]:- }"
+      done
+    } > "$report"
+    log_error "Dependency cycle detected; report: $report"
+    # mark blocked
+    for cn in "${cycle_nodes[@]}"; do
+      BLOCK_REASON["$cn"]="dependency cycle (see $report)"
+    done
+    return 1
+  fi
+  return 0
+}
+
+# topological sort using Kahn's algorithm and respecting STAGE and PRIORITY
+topological_sort() {
+  log_info "Computing topological build order"
+  # compute current indegree map (copy)
+  declare -A indeg
+  for n in "${!IN_DEGREE[@]}"; do indeg["$n"]=${IN_DEGREE["$n"]}; done
+  # initial queue: nodes with indeg 0
+  local -a queue=()
+  for n in "${!indeg[@]}"; do
+    if [ "${indeg[$n]}" -eq 0 ]; then
+      queue+=("$n")
+    fi
+  done
+
+  # comparator: choose nodes by stage (lower first), then priority (high first), then name
+  choose_best() {
+    # expects array of candidates in "$@" prints chosen as echo
+    local best=""
+    for c in "$@"; do
+      if [ -z "$best" ]; then best="$c"; continue; fi
+      local s_c=${NODE_STAGE[$c]:-0}; s_c=${s_c:-0}
+      local s_b=${NODE_STAGE[$best]:-0}; s_b=${s_b:-0}
+      if [ "$s_c" -lt "$s_b" ]; then best="$c"; continue; fi
+      if [ "$s_c" -gt "$s_b" ]; then continue; fi
+      # priority mapping: high < normal < low
+      local pmap() {
+        case "$1" in high) echo 1 ;; normal) echo 2 ;; low) echo 3 ;; *) echo 2 ;; esac
+      }
+      local pc=$(pmap "${NODE_PRIORITY[$c]:-normal}")
+      local pb=$(pmap "${NODE_PRIORITY[$best]:-normal}")
+      if [ "$pc" -lt "$pb" ]; then best="$c"; continue; fi
+      if [ "$pc" -gt "$pb" ]; then continue; fi
+      # tie: lexicographic
+      if [[ "$c" < "$best" ]]; then best="$c"; fi
+    done
+    echo "$best"
+  }
+
+  local -a order=()
+  while [ "${#queue[@]}" -gt 0 ]; do
+    # pick best among queue
+    local pick
+    pick="$(choose_best "${queue[@]}")"
+    # remove pick from queue
+    local newq=()
+    for el in "${queue[@]}"; do [ "$el" != "$pick" ] && newq+=("$el"); done
+    queue=("${newq[@]}")
+    order+=("$pick")
+    # for each neighbor (provider) decrement indeg
+    for nb in ${ADJ[$pick]:-}; do
+      indeg["$nb"]=$(( ${indeg[$nb]:-0} - 1 ))
+      if [ "${indeg[$nb]}" -eq 0 ]; then
+        queue+=("$nb")
+      fi
+    done
+  done
+
+  # verify all nodes included (those with desc)
+  local total=0
+  for n in "${!DESC_PATH[@]}"; do total=$((total+1)); done
+  if [ "${#order[@]}" -lt "$total" ]; then
+    log_warn "Topological ordering incomplete (some nodes blocked or cycles)"
+  fi
+
+  # write build-order atomically
+  mkdir -p "$(dirname "$BUILD_ORDER_FILE")"
+  local tmpbo="$(mktemp "${TMPROOT}/buildorder.XXXXXX")"
+  for p in "${order[@]}"; do
+    echo "$p" >> "$tmpbo"
+  done
+  mv -f "$tmpbo" "$BUILD_ORDER_FILE"
+  log_info "Build order written to $BUILD_ORDER_FILE (packages: ${#order[@]})"
+  return 0
+}
+
+# write deps-map.json (simple JSON serialization without jq)
+write_deps_map() {
+  mkdir -p "$DEPS_DIR"
+  local tmp="$(mktemp "${TMPROOT}/depsmap.XXXXXX")"
+  {
+    echo "{"
+    echo "  \"nodes\": {"
+    local first=1
+    for n in "${!DESC_PATH[@]}"; do
+      if [ "$first" -ne 1 ]; then echo "    ,"; fi
+      first=0
+      echo -n "    \"${n}\": {"
+      echo -n "\"version\":\"${NODE_VERSION[$n]}\","
+      echo -n "\"desc\":\"${DESC_PATH[$n]}\""
+      echo -n "}"
+    done
+    echo
+    echo "  },"
+    echo "  \"edges\": ["
+    local efirst=1
+    for from in "${!ADJ[@]}"; do
+      for to in ${ADJ[$from]}; do
+        if [ "$efirst" -ne 1 ]; then echo ","; fi
+        efirst=0
+        echo -n "    { \"from\": \"${from}\", \"to\":\"${to}\" }"
+      done
+    done
+    echo
+    echo "  ],"
+    echo "  \"blocked\": {"
+    local bfirst=1
+    for k in "${!BLOCK_REASON[@]}"; do
+      if [ "$bfirst" -ne 1 ]; then echo ","; fi
+      bfirst=0
+      echo -n "    \"${k}\": \"${BLOCK_REASON[$k]}\""
+    done
+    echo
+    echo "  }"
+    echo "}"
+  } > "$tmp"
+  mv -f "$tmp" "$DEPS_MAP_JSON"
+  log_info "Deps map written to $DEPS_MAP_JSON"
+}
+
+# produce blocked.list
+write_blocked_list() {
+  mkdir -p "$(dirname "$BLOCKED_LIST")"
+  local tmp="$(mktemp "${TMPROOT}/blocked.XXXXXX")"
+  for k in "${!BLOCK_REASON[@]}"; do
+    echo "${k}  # ${BLOCK_REASON[$k]}" >> "$tmp"
+  done
+  mv -f "$tmp" "$BLOCKED_LIST"
+  log_info "Blocked list written to $BLOCKED_LIST"
+}
+
+# explain function: print dependency tree & reason
+explain_pkg() {
+  local pkg="$1"
+  if [ -z "$pkg" ]; then
+    echo "explain: missing pkg name"
+    return 1
+  fi
+  log_start "depsolve" "explain-${pkg}"
+  echo "Explanation for package: $pkg" | tee -a "$LOGGER_CURRENT_OUT"
+  if [ -n "${BLOCK_REASON[$pkg]:-}" ]; then
+    echo "Blocked: ${BLOCK_REASON[$pkg]}" | tee -a "$LOGGER_CURRENT_OUT"
+  fi
+  echo "Version: ${NODE_VERSION[$pkg]:-unknown}" | tee -a "$LOGGER_CURRENT_OUT"
+  echo "Build deps: ${NODE_BUILD_DEPS[$pkg]:-}" | tee -a "$LOGGER_CURRENT_OUT"
+  echo "Run deps: ${NODE_RUN_DEPS[$pkg]:-}" | tee -a "$LOGGER_CURRENT_OUT"
+  echo "Provides: ${NODE_PROVIDES[$pkg]:-}" | tee -a "$LOGGER_CURRENT_OUT"
+  echo "Resolved providers (adj): ${ADJ[$pkg]:-}" | tee -a "$LOGGER_CURRENT_OUT"
+  # print reverse graph paths to root (BFS up to some depth)
+  echo "Dependents (reverse adj): ${REVERSE_ADJ[$pkg]:-}" | tee -a "$LOGGER_CURRENT_OUT"
+  log_end 0
+}
+
+# rebuild_system: calls update.sh for each package in build-order, in order
+rebuild_system() {
+  log_info "Starting full system rebuild via update.sh following build-order"
+  if [ ! -x "${SCRIPT_DIR}/update.sh" ]; then
+    log_error "update.sh not found or not executable in ${SCRIPT_DIR}"
+    return 1
+  fi
+  if [ ! -f "$BUILD_ORDER_FILE" ]; then
+    log_error "No build-order file found at $BUILD_ORDER_FILE. Run depsolve first."
+    return 1
+  fi
+  while IFS= read -r pkg; do
+    [ -z "$pkg" ] && continue
+    log_info "Rebuilding/updating package: $pkg"
+    # call update.sh (it should accept package name as arg)
+    "${SCRIPT_DIR}/update.sh" "$pkg" >> "$LOGGER_CURRENT_OUT" 2>> "$LOGGER_CURRENT_ERR" || {
+      log_error "update.sh failed for $pkg; aborting rebuild_system"
+      return 1
+    }
+  done < "$BUILD_ORDER_FILE"
+  log_info "System rebuild via update.sh finished"
+  return 0
+}
+
+# detect silent errors in depsolve logs
+detect_silent_errors_depsolve() {
+  local patterns="error|fail|missing|incompat|cycle|conflict|cannot"
+  if grep -Ei "$patterns" "$LOGGER_CURRENT_ERR" >/dev/null 2>&1; then
+    log_warn "Silent error patterns detected in depsolve stderr"
+    return 1
+  fi
+  return 0
+}
+
+# main flow for depsolve
+depsolve_main() {
+  local targets=("$@")
+  log_start "depsolve" "global"
+  index_all_descs
+  build_provides_index
+  init_targets "${targets[@]}"
+  expand_all_deps || true
+  # detect cycles
+  if ! detect_cycles; then
+    log_warn "Cycle detection flagged issues (see cycle_report.txt)"
+  fi
+  # generate topological order (does not include blocked nodes ideally)
+  topological_sort || true
+  # write outputs
+  write_deps_map
+  write_blocked_list
+  detect_silent_errors_depsolve || true
+  log_end 0
+}
+
+# --------------------------
+# CLI parsing
+# --------------------------
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+Options:
+  --all                Resolve all packages (default if no target)
+  --target <pkg>       Resolve starting from <pkg> (can be repeated)
+  --explain <pkg>      Explain dependency tree & block reason for <pkg>
+  --rebuild-system     After computing build order, call update.sh for each package
+  --rebuild-order-file <file>  Use custom build-order file
+  --verbose            Enable verbose debug logging
+  --help
+EOF
+}
+
+# parse args
+MODE="run"
+TARGETS=()
+REBUILD_SYS="no"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --all) shift ;;
+    --target) shift; TARGETS+=("$1"); shift ;;
+    --explain) shift; EXPLAIN_PKG="$1"; shift ;;
+    --rebuild-system) REBUILD_SYS="yes"; shift ;;
+    --rebuild-order-file) shift; BUILD_ORDER_FILE="$1"; shift ;;
+    --verbose) DEPSOLVE_VERBOSE=yes; shift ;;
+    --help) usage; exit 0 ;;
+    *) echo "Unknown arg $1"; usage; exit 1 ;;
+  esac
+done
+
+if [ -n "${EXPLAIN_PKG:-}" ]; then
+  index_all_descs
+  build_provides_index
+  expand_all_deps || true
+  explain_pkg "$EXPLAIN_PKG"
+  exit 0
+fi
+
+# run depsolve
+depsolve_main "${TARGETS[@]}"
+
+# optionally rebuild system
+if [ "$REBUILD_SYS" = "yes" ]; then
+  rebuild_system || {
+    log_error "rebuild_system failed"
+    exit 1
+  }
+fi
+
+# cleanup tmp
+rm -rf "$TMPROOT" 2>/dev/null || true
+
+exit 0
