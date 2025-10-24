@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# pre-configure hook for firefox: sets env, applies runtime patches if present
+set -euo pipefail
+pkg="firefox"
+ROOT="${ROOT:-./auto-builder}"
+LOG_OUT="${LOGGER_CURRENT_OUT:-${ROOT}/logs/build/${pkg}.out}"
+LOG_ERR="${LOGGER_CURRENT_ERR:-${ROOT}/logs/build/${pkg}.err}"
+SILENT_PATTERNS="${SILENT_PATTERNS:-error|failed|fatal|undefined reference}"
+
+trap 'rc=$?; if [ $rc -ne 0 ]; then echo "pre-configure failed (rc=$rc)" >>"$LOG_ERR"; fi; exit $rc' EXIT
+
+echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] pre-configure start" >>"$LOG_OUT"
+
+# helper
+_log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*" >>"$LOG_OUT"; }
+_err() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] ERROR: $*" >>"$LOG_ERR"; }
+
+# 1) Export recommended build flags for Firefox (can be overridden)
+export CFLAGS="${CFLAGS:--O2 -g}"
+export CXXFLAGS="${CXXFLAGS:--O2 -g}"
+export LDFLAGS="${LDFLAGS:-}"
+
+_log "Exported CFLAGS=${CFLAGS} CXXFLAGS=${CXXFLAGS}"
+
+# 2) Optional feature toggles (detected from OPTIONS_ENABLED)
+# e.g. enable wayland if requested
+if echo " ${OPTIONS_ENABLED:-} " | grep -q " wayland "; then
+  export MOZ_ENABLE_WAYLAND=1
+  _log "Wayland enabled for build"
+fi
+
+# 3) Apply local patches found under package/.../patches/
+PATCH_DIRS=( "${SCRIPT_DIR:-.}/package/*/${pkg}/patches" "${REPO_DIR}/package/*/${pkg}/patches" )
+for pd in ${PATCH_DIRS[@]}; do
+  for p in $pd/*.patch 2>/dev/null; do
+    [ -f "$p" ] || continue
+    _log "Applying patch $p"
+    # try patch with reject detection
+    if ! (cd "${BUILD_DIR}/${pkg}" && patch -p1 < "$p" >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+      _err "Patch $p failed to apply cleanly"
+      exit 5
+    fi
+  done
+done
+
+# 4) Prepare toolchain wrappers e.g., set python3 to env
+if command -v rustc >/dev/null 2>&1; then
+  _log "Rust present: $(rustc --version | head -n1)"
+else
+  _log "Rust not present; firefox build may fail if rust components required"
+fi
+
+_log "pre-configure done"
+exit 0
