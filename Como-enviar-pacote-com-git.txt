@@ -1,0 +1,4 @@
+git add "${PKG}-${VER}-${REL}.tar.xz" "package.json"
+git commit -m "Add ${PKG} ${VER}-${REL}"
+git tag -a "${PKG}-${VER}-${REL}" -m "Release ${PKG} ${VER}-${REL}"
+git push --follow-tags
